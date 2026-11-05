@@ -1271,10 +1271,7 @@ func (p *analyticsPlugin) afterTool(ctx agent.Context, t tool.Tool, args, result
 		return nil, nil
 	}
 	if !confirmationOutcome {
-		if msg, ok := retryAnswerError(result); ok {
-			// plugin/retryandreflect registered before this plugin short-circuits
-			// OnToolErrorCallback and returns a recovery payload with err == nil.
-			// Log it as TOOL_ERROR and suppress TOOL_COMPLETED and AGENT_RESPONSE.
+		if msg, ok := classifyToolResultError(result); ok {
 			p.logToolError(ctx, id, t, func() rowSpan { return span }, name, callID, args, errors.New(msg))
 			return nil, nil
 		}
@@ -1327,16 +1324,40 @@ func (p *analyticsPlugin) onToolError(ctx agent.Context, t tool.Tool, args map[s
 	return nil, nil
 }
 
+const mcpToolErrorMessage = "Tool returned an MCP result with isError=true."
+
 func (p *analyticsPlugin) logToolError(ctx context.Context, id identity, t tool.Tool, spanFn func() rowSpan, name, callID string, args map[string]any, err error) {
 	p.logEvent(ctx, id, EventToolError, spanFn, func(d *eventData) {
 		origin := p.resolveToolOrigin(ctx, id, t, args)
 		d.content = toolContent(name, "args", args, origin)
 		d.failed = true
 		if err != nil {
-			d.errMsg = err.Error()
+			d.errMsg = cmp.Or(err.Error(), fmt.Sprintf("%T", err))
 		}
 		d.functionCallID = callID
 	})
+}
+
+// classifyToolResultError inspects a non-error tool result map for structured
+// failure indicators in adk-python precedence order.
+func classifyToolResultError(result map[string]any) (string, bool) {
+	if msg, ok := retryAnswerError(result); ok {
+		return msg, true
+	}
+	// Reserved slot for future Config.ToolResultClassifier (#2014) before built-in MCP isError.
+	return mcpResultError(result)
+}
+
+func mcpResultError(result map[string]any) (string, bool) {
+	if len(result) == 0 {
+		return "", false
+	}
+	for _, k := range []string{"isError", "is_error"} {
+		if v, ok := result[k].(bool); ok && v {
+			return mcpToolErrorMessage, true
+		}
+	}
+	return "", false
 }
 
 // toolName returns the name of t, or "" if t is nil or its Name method
