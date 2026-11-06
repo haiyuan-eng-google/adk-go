@@ -264,6 +264,7 @@ func (r *Runner) newNodeInvocationContext(
 	msg *genai.Content,
 	cfg agent.RunConfig,
 ) agent.Context {
+	ctx = withExecutionID(ctx)
 	ctx = parentmap.ToContext(ctx, r.parents)
 	ctx = runconfig.ToContext(ctx, &runconfig.RunConfig{
 		StreamingMode: runconfig.StreamingMode(cfg.StreamingMode),
