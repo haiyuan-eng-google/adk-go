@@ -58,9 +58,11 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/agent/workflowagents/parallelagent"
 	"google.golang.org/adk/v2/model"
 	baseplugin "google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/plugin/retryandreflect"
+	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
@@ -6865,4 +6867,341 @@ func TestPlugin_ToolResultClassifierPrecedence_RetryAnswerBeforeIsError(t *testi
 	if got := errRow["error_message"]; got != "reflect detail" {
 		t.Errorf("TOOL_ERROR error_message = %v, want %q", got, "reflect detail")
 	}
+}
+
+func TestPlugin_OnRunErrorCallback(t *testing.T) {
+	t.Run("records error for AfterRunCallback", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		if p.OnRunErrorCallback() == nil {
+			t.Fatal("OnRunErrorCallback() = nil, want non-nil")
+		}
+
+		winnerDone := make(chan struct{})
+		var winnerDoneOnce sync.Once
+		winner, err := agent.New(agent.Config{
+			Name: "winner",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					ev := session.NewEvent(ictx, ictx.InvocationID())
+					ev.Author = "winner"
+					ev.LLMResponse = model.LLMResponse{Content: textContent("model", "fast answer"), TurnComplete: true}
+					yield(ev, nil)
+				}
+			},
+			AfterAgentCallbacks: []agent.AfterAgentCallback{
+				func(agent.Context) (*genai.Content, error) {
+					winnerDoneOnce.Do(func() { close(winnerDone) })
+					return nil, nil
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(winner): %v", err)
+		}
+		slowStarted := make(chan struct{})
+		slowBranch, err := agent.New(agent.Config{
+			Name: "slow_branch",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					close(slowStarted)
+					<-ictx.Done()
+					yield(nil, ictx.Err())
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(slow_branch): %v", err)
+		}
+		fan, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "fan", SubAgents: []agent.Agent{winner, slowBranch}},
+		})
+		if err != nil {
+			t.Fatalf("parallelagent.New: %v", err)
+		}
+		root, err := agent.New(agent.Config{
+			Name:      "test_agent",
+			SubAgents: []agent.Agent{fan},
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					pctx, cancel := context.WithCancelCause(ictx)
+					defer cancel(nil)
+					pic := ictx.WithContext(pctx)
+					var wonContent *genai.Content
+					var cancelOnce sync.Once
+					for ev, fanErr := range fan.Run(pic) {
+						if fanErr != nil {
+							if errors.Is(fanErr, context.Canceled) && wonContent != nil {
+								continue
+							}
+							break
+						}
+						if ev != nil && ev.Author == "winner" && wonContent == nil {
+							wonContent = ev.Content
+							cancelOnce.Do(func() {
+								go func() {
+									<-winnerDone
+									<-slowStarted
+									cancel(errors.New("aborted fanout: Bearer secret-token-123"))
+								}()
+							})
+						}
+					}
+					final := session.NewEvent(ictx, ictx.InvocationID())
+					final.Author = "test_agent"
+					final.LLMResponse = model.LLMResponse{Content: wonContent, TurnComplete: true}
+					if !yield(final, nil) {
+						return
+					}
+					yield(nil, errors.New("runner failure: Bearer secret-token-123"))
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(test_agent): %v", err)
+		}
+
+		var gotRunErr error
+		for _, runErr := range newTestRunner(t, root, p).Run(t.Context(), "u1", "s-on-run-error", textContent("user", "go"), agent.RunConfig{}) {
+			if runErr != nil && gotRunErr == nil {
+				gotRunErr = runErr
+			}
+		}
+		if gotRunErr == nil {
+			t.Fatal("runner.Run error = nil, want non-nil")
+		}
+
+		rows := collectRows(t, requests, untilInvocationEnd)
+		if n := len(rowsOfType(rows, EventInvocationCompleted)); n != 0 {
+			t.Fatalf("got %d INVOCATION_COMPLETED rows, want 0; events: %v", n, eventTypes(rows))
+		}
+		agentErr := onlyRowOfType(t, rows, EventAgentError)
+		if agentErr["status"] != "ERROR" {
+			t.Errorf("AGENT_ERROR status = %v, want ERROR", agentErr["status"])
+		}
+		invErr := onlyRowOfType(t, rows, EventInvocationError)
+		if invErr["status"] != "ERROR" {
+			t.Errorf("INVOCATION_ERROR status = %v, want ERROR", invErr["status"])
+		}
+		msg, _ := invErr["error_message"].(string)
+		if !strings.Contains(msg, "aborted fanout: Bearer [REDACTED]") {
+			t.Errorf("INVOCATION_ERROR error_message = %q, want redacted failure cause %q", msg, "aborted fanout: Bearer [REDACTED]")
+		}
+		if strings.Contains(msg, "secret-token-123") {
+			t.Errorf("INVOCATION_ERROR error_message leaked secret: %q", msg)
+		}
+	})
+
+	t.Run("nil error is a no-op", func(t *testing.T) {
+		p, requests, mCtx := setupTestPlugin(t)
+		var errs callbackErrors
+		_, err := p.BeforeRunCallback()(mCtx)
+		errs.add(nil, err)
+		errs.add(p.BeforeAgentCallback()(mCtx))
+		errs.add(p.AfterAgentCallback()(mCtx))
+		errs.check(t)
+
+		p.OnRunErrorCallback()(mCtx, nil)
+		p.AfterRunCallback()(mCtx)
+
+		rows := collectRows(t, requests, untilInvocationEnd)
+		if n := len(rowsOfType(rows, EventInvocationError)); n != 0 {
+			t.Fatalf("got %d INVOCATION_ERROR rows, want 0; events: %v", n, eventTypes(rows))
+		}
+		onlyRowOfType(t, rows, EventInvocationCompleted)
+	})
+}
+
+func TestPlugin_RunnerPluginConfigClose(t *testing.T) {
+	ctx := t.Context()
+	okHTTPClient := &http.Client{
+		Transport: &mockTransport{
+			roundTrip: func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/tables/") {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(`{"type":"TABLE","labels":{"adk_schema_version":"2"}}`)),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("{}")),
+				}, nil
+			},
+		},
+	}
+
+	newOwnedPlugin := func(t *testing.T, mutate func(*Config)) (*baseplugin.Plugin, chan *storagepb.AppendRowsRequest) {
+		t.Helper()
+		bqClient, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(okHTTPClient))
+		if err != nil {
+			t.Fatalf("bq.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = bqClient.Close() })
+
+		lis := bufconn.Listen(1 << 20)
+		gSrv := grpc.NewServer()
+		requestsChan := make(chan *storagepb.AppendRowsRequest, 100)
+		storagepb.RegisterBigQueryWriteServer(gSrv, &fakeBigQueryWriteServer{requests: requestsChan})
+		go func() { _ = gSrv.Serve(lis) }()
+		t.Cleanup(gSrv.Stop)
+
+		conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("grpc.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+
+		writeClient, err := bqstorage.NewBigQueryWriteClient(ctx, option.WithGRPCConn(conn))
+		if err != nil {
+			t.Fatalf("NewBigQueryWriteClient: %v", err)
+		}
+
+		cfg := DefaultConfig()
+		cfg.ProjectID = "test-project"
+		cfg.DatasetID = "test_dataset"
+		cfg.TableName = "test-table"
+		cfg.DisableCreateViews = true
+		if mutate != nil {
+			mutate(&cfg)
+		}
+		p, err := newBigQueryAgentAnalyticsPlugin(ctx, cfg, bqClient, writeClient, true)
+		if err != nil {
+			t.Fatalf("newBigQueryAgentAnalyticsPlugin: %v", err)
+		}
+		return p, requestsChan
+	}
+
+	t.Run("flushes buffered rows and closes owned clients idempotently via PluginConfig.Close", func(t *testing.T) {
+		var closeCount atomic.Int32
+		origClose := closeBQClient
+		closeBQClient = func(c *bq.Client) error {
+			closeCount.Add(1)
+			return origClose(c)
+		}
+		t.Cleanup(func() { closeBQClient = origClose })
+
+		p, requests := newOwnedPlugin(t, func(c *Config) {
+			c.BatchSize = 100
+			c.BatchFlushIntv = time.Hour
+		})
+		mCtx := &mockInvocationContext{
+			ctx:          ctx,
+			agentName:    "close-agent",
+			sessionID:    "sess-close",
+			invocationID: "inv-close",
+			userID:       "user-close",
+		}
+		var errs callbackErrors
+		_, err := p.BeforeRunCallback()(mCtx)
+		errs.add(nil, err)
+		errs.add(p.BeforeAgentCallback()(mCtx))
+		errs.add(p.OnEventCallback()(mCtx, &session.Event{
+			ID:     "ev-buffered",
+			Author: "close-agent",
+			LLMResponse: model.LLMResponse{
+				Content:      &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "buffered answer"}}},
+				TurnComplete: true,
+			},
+		}))
+		errs.check(t)
+
+		select {
+		case req := <-requests:
+			t.Fatalf("received unexpected early batch before Close: %v", req)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		pluginCfg := runner.PluginConfig{
+			Plugins:      []*baseplugin.Plugin{p},
+			CloseTimeout: 5 * time.Second,
+		}
+		if err := pluginCfg.Close(ctx); err != nil {
+			t.Fatalf("pluginCfg.Close() error = %v", err)
+		}
+		if got := closeCount.Load(); got != 1 {
+			t.Errorf("closeBQClient count after first PluginConfig.Close = %d, want 1", got)
+		}
+
+		rows := collectRows(t, requests, func(rows []map[string]any) bool {
+			return len(rowsOfType(rows, EventAgentResponse)) >= 1
+		})
+		if n := len(rowsOfType(rows, EventInvocationStarting)); n != 1 {
+			t.Errorf("got %d INVOCATION_STARTING rows after Close flush, want 1", n)
+		}
+		if n := len(rowsOfType(rows, EventAgentStarting)); n != 1 {
+			t.Errorf("got %d AGENT_STARTING rows after Close flush, want 1", n)
+		}
+		if err := pluginCfg.Close(ctx); err != nil {
+			t.Fatalf("second pluginCfg.Close() error = %v", err)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("p.Close() after PluginConfig.Close error = %v", err)
+		}
+		if got := closeCount.Load(); got != 1 {
+			t.Errorf("closeBQClient count after repeated Close = %d, want 1", got)
+		}
+	})
+
+	t.Run("closes plugin after runner execution", func(t *testing.T) {
+		var closeCount atomic.Int32
+		origClose := closeBQClient
+		closeBQClient = func(c *bq.Client) error {
+			closeCount.Add(1)
+			return origClose(c)
+		}
+		t.Cleanup(func() { closeBQClient = origClose })
+
+		p, requests := newOwnedPlugin(t, nil)
+		root, err := agent.New(agent.Config{
+			Name: "echo",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					ev := session.NewEvent(ictx, ictx.InvocationID())
+					ev.Author = "echo"
+					ev.LLMResponse = model.LLMResponse{
+						Content:      &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "ok"}}},
+						TurnComplete: true,
+					}
+					yield(ev, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New: %v", err)
+		}
+		pluginCfg := runner.PluginConfig{
+			Plugins:      []*baseplugin.Plugin{p},
+			CloseTimeout: 5 * time.Second,
+		}
+		r, err := runner.New(runner.Config{
+			AppName:           "close-app",
+			Agent:             root,
+			SessionService:    session.InMemoryService(),
+			AutoCreateSession: true,
+			PluginConfig:      pluginCfg,
+		})
+		if err != nil {
+			t.Fatalf("runner.New: %v", err)
+		}
+		for _, err := range r.Run(ctx, "u1", "s1", &genai.Content{Role: "user", Parts: []*genai.Part{{Text: "hi"}}}, agent.RunConfig{}) {
+			if err != nil {
+				t.Fatalf("runner.Run error = %v", err)
+			}
+		}
+		if got := closeCount.Load(); got != 0 {
+			t.Fatalf("closeBQClient called %d times before PluginConfig.Close, want 0", got)
+		}
+		if err := pluginCfg.Close(ctx); err != nil {
+			t.Fatalf("pluginCfg.Close() error = %v", err)
+		}
+		if got := closeCount.Load(); got != 1 {
+			t.Errorf("closeBQClient called %d times after PluginConfig.Close, want 1", got)
+		}
+		rows := collectRows(t, requests, func(rows []map[string]any) bool {
+			return len(rowsOfType(rows, EventInvocationCompleted)) == 1
+		})
+		if n := len(rowsOfType(rows, EventAgentResponse)); n != 1 {
+			t.Errorf("got %d AGENT_RESPONSE rows, want 1", n)
+		}
+	})
 }

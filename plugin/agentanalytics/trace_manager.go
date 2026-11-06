@@ -363,13 +363,26 @@ type retiredCause struct {
 	branch            string
 	path              string
 	swallowableBySelf bool
+	customParallel    bool
 }
 
 // firstRetiredCause returns the first failure cause that an activation that
 // retired under rec left on it, or nil.
 func (rec *spanRecord) firstRetiredCause() error {
 	for _, c := range rec.retiredCauses {
-		if c.err != nil {
+		if c.err != nil && !c.customParallel {
+			return c.err
+		}
+	}
+	return nil
+}
+
+// firstCustomParallelRetiredCause returns the first failure cause that an
+// activation that retired under rec left on it under a custom-parent
+// WithCancelCause wrapping a ParallelAgent, or nil.
+func (rec *spanRecord) firstCustomParallelRetiredCause() error {
+	for _, c := range rec.retiredCauses {
+		if c.err != nil && c.customParallel {
 			return c.err
 		}
 	}
@@ -548,6 +561,13 @@ type invocationTrace struct {
 	// partial, themselves or through an activation that ran under them: if
 	// the caller stopped reading on such an event, they did not fail.
 	partialLineage map[string]bool
+	// runErr holds the first non-nil error reported by OnRunErrorCallback for
+	// this run. It gates custom-parent WithCancelCause propagation across
+	// parallel branches at AfterRun so that handled custom cancellations (such
+	// as "first answer wins" parents that cancel remaining branches and return
+	// nil) end with INVOCATION_COMPLETED while failing custom parents report
+	// the branch failure.
+	runErr error
 }
 
 // recordedError is an unrecovered error of an invocation and the span ID of
@@ -588,12 +608,11 @@ func newInvocationTraceWithSpan(sc trace.SpanContext, traceID string, now time.T
 		unrecoveredErrors: map[string]recordedError{},
 	}
 	// Continue the caller's OpenTelemetry trace, if any, with an invocation
-	// span that is a child of the caller's span. adk-python reuses the ambient
-	// span ID as the invocation span ID, but ADK Go's runner opens no
-	// per-invocation OpenTelemetry span before it invokes plugin callbacks,
-	// so a caller's long-lived request or server span would be reused as the
-	// span_id of every invocation that it serves. A child invocation span
-	// keeps the span trees of those invocations apart.
+	// span that is a child of the active ambient span (such as ADK's
+	// per-invocation OpenTelemetry span opened before plugin callbacks or an
+	// enclosing caller span). Creating a child invocation span keeps the
+	// plugin's BigQuery span tree separate from any ambient request/server or
+	// ADK telemetry span, whose IDs are not written as BigQuery rows.
 	//
 	// Apart from the parent_span_id of the invocation span, which is the
 	// caller's span ID when the invocation starts in a span, only the trace
@@ -1218,13 +1237,13 @@ func withinPath(path, ancestor string, sameAgent bool) bool {
 // workflow.WithUseSubBranch when they want isolated session branch history in
 // addition to distinct node paths.
 //
-// Invocations are keyed by invocation ID alone. A run that reuses the ID of a
-// finished run, as a HITL resume reuses the ID of the paused run, starts
-// tracking state, and an invocation span, of its own; without ambient spans,
-// the rows of both runs have the trace_id that is derived from the invocation
-// ID. Two runs that overlap with one invocation ID are not supported: no
-// callback carries a handle of its run, so they share tracking state and can
-// end each other's spans.
+// Invocations are keyed by (invocation ID, execution ID) when the callback
+// context carries an execution ID (agent.ExecutionIDFromContext), falling back
+// to invocation ID alone when none is present. A run that reuses the
+// invocation ID of a paused or finished run, or overlaps with another run that
+// shares its invocation ID, gets tracking state and an invocation span of its
+// own; without ambient spans, the rows of both runs share the trace_id derived
+// from the invocation ID.
 type traceManager struct {
 	mu              sync.Mutex
 	invocations     map[string]*invocationTrace
@@ -1371,6 +1390,86 @@ func (tm *traceManager) rememberAgentTree(runner agent.Agent) agent.Agent {
 	return cur
 }
 
+// traceKey returns the map key under which tm tracks the active, completed,
+// and evicted state of id's Runner execution. When ctx carries a per-run
+// ExecutionID (agent.ExecutionIDFromContext), overlapping Runner.Run calls
+// that share an InvocationID (such as a paused HITL/workflow run whose late
+// goroutines overlap with a resumed run, or concurrent runs with the same
+// InvocationID) get separate invocationTrace instances while still writing
+// id.invocationID to the BigQuery invocation_id column and attributes.adk.
+func (id identity) traceKey() string {
+	if id.invocationID == "" || id.executionID == "" {
+		return id.invocationID
+	}
+	return id.invocationID + "\x00" + id.executionID
+}
+
+func traceKeyInvocationID(key string) string {
+	invID, _, _ := strings.Cut(key, "\x00")
+	return invID
+}
+
+// resolveTraceKeyLocked returns the map key for id in tm. When id carries no
+// executionID (as in direct traceManager unit tests or post-run helper calls
+// with a bare context), it falls back to a unique entry with prefix
+// id.invocationID+"\x00" if no bare id.invocationID entry exists. tm.mu must
+// be held.
+func (tm *traceManager) resolveTraceKeyLocked(id identity, start bool) string {
+	key := id.traceKey()
+	if id.invocationID == "" || id.executionID != "" {
+		return key
+	}
+	if _, ok := tm.invocations[key]; ok {
+		return key
+	}
+	if !start {
+		if _, ok := tm.completed[key]; ok {
+			return key
+		}
+	}
+	if _, ok := tm.evicted[key]; ok {
+		return key
+	}
+	prefix := id.invocationID + "\x00"
+	var match string
+	for k := range tm.invocations {
+		if strings.HasPrefix(k, prefix) {
+			if match != "" {
+				return key
+			}
+			match = k
+		}
+	}
+	if match != "" {
+		return match
+	}
+	if !start {
+		for k := range tm.completed {
+			if strings.HasPrefix(k, prefix) {
+				if match != "" && match != k {
+					return key
+				}
+				match = k
+			}
+		}
+		if match != "" {
+			return match
+		}
+	}
+	for k := range tm.evicted {
+		if strings.HasPrefix(k, prefix) {
+			if match != "" && match != k {
+				return key
+			}
+			match = k
+		}
+	}
+	if match != "" {
+		return match
+	}
+	return key
+}
+
 // invocation returns the trace of the invocation id belongs to, creating it
 // on the invocation's first callback. Callbacks without an invocation ID
 // get a trace that is not tracked, so that their rows still have IDs. Completed
@@ -1399,9 +1498,10 @@ func (tm *traceManager) lookupInvocation(ctx context.Context, id identity, start
 	var maxTracked int
 	var logf func(string, ...any)
 	tm.mu.Lock()
-	inv, ok := tm.invocations[id.invocationID]
+	key := tm.resolveTraceKeyLocked(id, start)
+	inv, ok := tm.invocations[key]
 	if !ok {
-		if completed := tm.completed[id.invocationID]; completed != nil {
+		if completed := tm.completed[key]; completed != nil {
 			if !start {
 				late := tm.lateLocked(completed, sc, tm.traceIDFor(id.invocationID), now)
 				late.lastActive.Store(now.UnixNano())
@@ -1413,16 +1513,16 @@ func (tm *traceManager) lookupInvocation(ctx context.Context, id identity, start
 				return late
 			}
 			tm.completionOrder.Remove(completed.position)
-			delete(tm.completed, id.invocationID)
+			delete(tm.completed, key)
 		}
-		ev, wasEvicted := tm.evicted[id.invocationID]
+		ev, wasEvicted := tm.evicted[key]
 		inv = newInvocationTraceWithSpan(sc, tm.traceIDFor(id.invocationID), now)
 		if wasEvicted {
 			inv.restoreEvicted(ev)
 		}
-		tm.invocations[id.invocationID] = inv
+		tm.invocations[key] = inv
 		tm.inserts++
-		warnIDs = tm.evictLocked(now, id.invocationID)
+		warnIDs = tm.evictLocked(now, key)
 		maxTracked = tm.maxTracked
 		logf = tm.logf
 	}
@@ -1433,7 +1533,7 @@ func (tm *traceManager) lookupInvocation(ctx context.Context, id identity, start
 	tm.mu.Unlock()
 	if logf != nil {
 		for _, evictedID := range warnIDs {
-			logf("agentanalytics: trace manager capacity (%d) exceeded; evicting active invocation %q", maxTracked, evictedID)
+			logf("agentanalytics: trace manager capacity (%d) exceeded; evicting active invocation %q", maxTracked, traceKeyInvocationID(evictedID))
 		}
 	}
 	return inv
@@ -1822,14 +1922,16 @@ func (tm *traceManager) endInvocation(ctx context.Context, id identity) rowSpan 
 		ambient = sc.TraceID().String()
 	}
 	var inv *invocationTrace
+	var key string
 	if id.invocationID != "" {
 		tm.mu.Lock()
-		inv = tm.invocations[id.invocationID]
+		key = tm.resolveTraceKeyLocked(id, false)
+		inv = tm.invocations[key]
 		if inv == nil {
 			inv = newInvocationTraceWithSpan(sc, tm.traceIDFor(id.invocationID), now)
-			if ev, ok := tm.evicted[id.invocationID]; ok {
+			if ev, ok := tm.evicted[key]; ok {
 				inv.restoreEvicted(ev)
-			} else if completed := tm.completed[id.invocationID]; completed != nil {
+			} else if completed := tm.completed[key]; completed != nil {
 				inv.restoreEvicted(completed.identity)
 			}
 		}
@@ -1850,12 +1952,15 @@ func (tm *traceManager) endInvocation(ctx context.Context, id identity) rowSpan 
 	inv.mu.Unlock()
 	if id.invocationID != "" {
 		tm.mu.Lock()
+		if key == "" {
+			key = tm.resolveTraceKeyLocked(id, false)
+		}
 		// Publish the final identity, including any trace adopted by rowSpan,
 		// before removing active state. Late Live callbacks may start and end
 		// an operation, so their state is shared separately from the finished run.
-		tm.rememberCompletedLocked(id.invocationID, id.agentName, inv)
-		delete(tm.evicted, id.invocationID)
-		delete(tm.invocations, id.invocationID)
+		tm.rememberCompletedLocked(key, id.agentName, inv)
+		delete(tm.evicted, key)
+		delete(tm.invocations, key)
 		tm.mu.Unlock()
 	}
 	return row
@@ -2632,6 +2737,8 @@ func (inv *invocationTrace) retireAgentLocked(i int, done bool, since uint64) {
 	}
 	ownCtxCause := rec.contextFailureCause()
 	inheritedCause := rec.firstRetiredCause()
+	ownCustomParallelCause := rec.customParallelFailureCause()
+	inheritedCustomParallelCause := rec.firstCustomParallelRetiredCause()
 	idx := i
 	inv.agentStack = slices.Delete(inv.agentStack, i, i+1)
 	// Also retire any unclosed descendant spans in rec's subtree (for example,
@@ -2639,7 +2746,7 @@ func (inv *invocationTrace) retireAgentLocked(i int, done bool, since uint64) {
 	// AfterAgentCallback, including one whose direct parent already retired
 	// earlier while launcherOpenLocked held it open), except the failed ones
 	// and what runs under them.
-	var descendantOpenCause error
+	var descendantOpenCause, descendantCustomParallelCause error
 	var retired []*spanRecord
 	for idx < len(inv.agentStack) {
 		d := inv.agentStack[idx]
@@ -2658,8 +2765,14 @@ func (inv *invocationTrace) retireAgentLocked(i int, done bool, since uint64) {
 			}
 			if drainedParent {
 				inheritedCause = cmp.Or(inheritedCause, d.openFailureCause())
-			} else if descendantOpenCause == nil {
-				descendantOpenCause = d.openFailureCause()
+				inheritedCustomParallelCause = cmp.Or(inheritedCustomParallelCause, d.customParallelFailureCause(), d.firstCustomParallelRetiredCause())
+			} else {
+				if descendantOpenCause == nil {
+					descendantOpenCause = d.openFailureCause()
+				}
+				if descendantCustomParallelCause == nil {
+					descendantCustomParallelCause = cmp.Or(d.customParallelFailureCause(), d.firstCustomParallelRetiredCause())
+				}
 			}
 			if inv.isLate {
 				retired = append(retired, d)
@@ -2684,6 +2797,21 @@ func (inv *invocationTrace) retireAgentLocked(i int, done bool, since uint64) {
 					branch:            rec.branch,
 					path:              rec.path,
 					swallowableBySelf: swallowable,
+				})
+				break
+			}
+		}
+	} else if customCause := cmp.Or(ownCustomParallelCause, inheritedCustomParallelCause, descendantCustomParallelCause); customCause != nil {
+		swallowable := !rec.propagatesChildError && ownCustomParallelCause == nil && inheritedCustomParallelCause != nil && descendantCustomParallelCause == nil
+		for anc := rec.parent; anc != nil; anc = anc.parent {
+			if slices.Contains(inv.agentStack, anc) {
+				anc.retiredCauses = append(anc.retiredCauses, retiredCause{
+					err:               customCause,
+					name:              rec.name,
+					branch:            rec.branch,
+					path:              rec.path,
+					swallowableBySelf: swallowable,
+					customParallel:    true,
 				})
 				break
 			}
@@ -3438,6 +3566,26 @@ func (tm *traceManager) clearError(ctx context.Context, id identity, key string)
 	}
 }
 
+// recordRunError records a runner-exposed error reported by OnRunErrorCallback
+// on the active invocation trace of id, if one is tracked.
+func (tm *traceManager) recordRunError(ctx context.Context, id identity, err error) {
+	if err == nil || id.invocationID == "" {
+		return
+	}
+	tm.mu.Lock()
+	key := tm.resolveTraceKeyLocked(id, false)
+	inv := tm.invocations[key]
+	tm.mu.Unlock()
+	if inv == nil {
+		return
+	}
+	inv.mu.Lock()
+	if inv.runErr == nil {
+		inv.runErr = err
+	}
+	inv.mu.Unlock()
+}
+
 // popUnclosedAgentSpans ends the invocation's agent spans that are still open
 // when the invocation terminates and returns the invocation's terminal error,
 // if any, together with the open spans that the error is attributed to.
@@ -3666,6 +3814,11 @@ func (tm *traceManager) popUnclosedAgentSpans(ctx context.Context, id identity) 
 		if e.err == nil || (stoppedMidStream && e.canceled && errors.Is(e.err, context.Canceled)) {
 			continue
 		}
+		if errors.Is(e.err, context.Canceled) {
+			if failingIdx := inv.activationOfLocked(e); failingIdx > 0 && inv.canceledByHandledCustomParallelLocked(inv.agentStack[failingIdx]) {
+				continue
+			}
+		}
 		if e.collateral && cancelErr == nil {
 			collateralCause = cmp.Or(collateralCause, e.cause)
 			continue
@@ -3716,7 +3869,7 @@ func (tm *traceManager) popUnclosedAgentSpans(ctx context.Context, id identity) 
 		}
 		partialSuppress := inv.lastEventPartial && siblingCause == nil
 		ignoreCall := func(call *spanRecord) bool {
-			return canceledByStop(call) || (partialSuppress && !inv.inWorkflowNodeSubtreeLocked(call.parent))
+			return canceledByStop(call) || inv.canceledByHandledCustomParallelLocked(call.parent) || (partialSuppress && !inv.inWorkflowNodeSubtreeLocked(call.parent))
 		}
 		failingIdx := inv.agentWithOpenCallLocked(ignoreCall)
 		if failingIdx <= 0 {
@@ -3732,7 +3885,7 @@ func (tm *traceManager) popUnclosedAgentSpans(ctx context.Context, id identity) 
 					continue
 				}
 				stoppedOn := inv.partialLineage[rec.spanID] && (inv.lastEventPartial || inv.hasCanceledByStopUnderLocked(i, canceledByStop))
-				if !rec.responded() && !canceledByStop(rec) && !stoppedOn {
+				if !rec.responded() && !canceledByStop(rec) && !stoppedOn && !inv.canceledByHandledCustomParallelLocked(rec) {
 					failingIdx = i
 					break
 				}
@@ -5094,6 +5247,63 @@ func (rec *spanRecord) contextFailureCause() error {
 	return cause
 }
 
+// customParallelFailureCause returns the rawContextFailureCause of the
+// outermost parallel branch in rec's ancestor chain when rec runs at or
+// under a parallel branch whose enclosing ParallelAgent context was also
+// canceled with a qualifying cause (as when a custom parent wraps a
+// ParallelAgent in context.WithCancelCause and cancels that outer context).
+// When the cancellation is already scoped to the parallel branch alone,
+// contextFailureCause handles it and this returns nil.
+func (rec *spanRecord) customParallelFailureCause() error {
+	if rec.rawContextFailureCause() == nil {
+		return nil
+	}
+	top := rec
+	var parallelBranch *spanRecord
+	if top.isParallelBranch() {
+		parallelBranch = top
+	}
+	for top.parent != nil && top.parent.rawContextFailureCause() != nil {
+		top = top.parent
+		if top.isParallelBranch() {
+			parallelBranch = top
+		}
+	}
+	if parallelBranch == nil || top.isParallelBranch() {
+		return nil
+	}
+	return parallelBranch.rawContextFailureCause()
+}
+
+// canceledByHandledCustomParallelLocked reports whether rec runs at or
+// under a parallel branch whose enclosing ParallelAgent had its own context
+// canceled with a non-context.Canceled cause by an enclosing custom agent (so
+// the ParallelAgent's parent or an un-canceled ancestor above it responded,
+// either by forwarding the winning branch event or emitting its own final
+// response, and the invocation context itself was not canceled with a cause)
+// while the run succeeded without a runner error (inv.runErr == nil), as when
+// a "first answer wins" custom parent cancels a context.WithCancelCause
+// wrapping a ParallelAgent.
+func (inv *invocationTrace) canceledByHandledCustomParallelLocked(rec *spanRecord) bool {
+	if inv.runErr != nil || rec == nil || rec.rawContextFailureCause() == nil || inv.agentStack[0].rawContextFailureCause() != nil {
+		return false
+	}
+	for cur := rec; cur != nil && cur.rawContextFailureCause() != nil; cur = cur.parent {
+		if !cur.isParallelBranch() || cur.parent == nil || cur.parent.rawContextFailureCause() == nil {
+			continue
+		}
+		if cur.parent.responded() {
+			return true
+		}
+		for anc := cur.parent.parent; anc != nil && anc.kind == spanKindAgent; anc = anc.parent {
+			if anc.rawContextFailureCause() == nil && anc.responded() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // openFailureCause returns rec's contextFailureCause, or else the first of
 // rec.retiredCauses.
 func (rec *spanRecord) openFailureCause() error {
@@ -5103,12 +5313,20 @@ func (rec *spanRecord) openFailureCause() error {
 // openFailureCauseLocked returns the first non-nil openFailureCause across the
 // invocation's agentStack (most recent first, including retiredCauses on the
 // invocation root at index 0), or nil if none ended with a qualifying cause.
-// Open model and tool call contexts derive from their owner activation's
-// context, so scanning agentStack covers them too.
+// When OnRunErrorCallback recorded a terminal runner error (inv.runErr != nil),
+// custom-parent WithCancelCause cancellations across parallel branches are
+// included as well. Open model and tool call contexts derive from their owner
+// activation's context, so scanning agentStack covers them too.
 func (inv *invocationTrace) openFailureCauseLocked() error {
 	for i := len(inv.agentStack) - 1; i >= 0; i-- {
-		if cause := inv.agentStack[i].openFailureCause(); cause != nil {
+		rec := inv.agentStack[i]
+		if cause := rec.openFailureCause(); cause != nil {
 			return cause
+		}
+		if inv.runErr != nil {
+			if cause := cmp.Or(rec.customParallelFailureCause(), rec.firstCustomParallelRetiredCause()); cause != nil {
+				return cause
+			}
 		}
 	}
 	return nil

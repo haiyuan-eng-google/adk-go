@@ -508,6 +508,7 @@ func newBigQueryAgentAnalyticsPlugin(
 
 		OnUserMessageCallback: p.onUserMessage,
 		BeforeRunCallback:     p.beforeRun,
+		OnRunErrorCallback:    p.onRunError,
 		AfterRunCallback:      p.afterRun,
 		OnEventCallback:       p.onEvent,
 
@@ -801,6 +802,16 @@ func (p *analyticsPlugin) beforeRun(ctx agent.InvocationContext) (*genai.Content
 		return p.traces.invocationSpan(ctx, id, runnerAgentOf(ctx))
 	}, nil)
 	return nil, nil
+}
+
+// onRunError records that the runner is about to yield a terminal error for
+// the run before AfterRunCallback executes.
+func (p *analyticsPlugin) onRunError(ctx agent.InvocationContext, err error) {
+	defer p.recoverCallback(EventInvocationError)
+	if err == nil {
+		return
+	}
+	p.traces.recordRunError(ctx, identityOf(ctx), err)
 }
 
 // afterRun ends the invocation. It writes an AGENT_ERROR row for each agent
@@ -1741,6 +1752,7 @@ type identity struct {
 	agentName    string
 	sessionID    string
 	invocationID string
+	executionID  string
 	userID       string
 	appName      string
 	branch       string
@@ -1753,12 +1765,17 @@ type identity struct {
 // workflow runs), so each field is read on its own and left empty on a
 // panic.
 func identityOf(ctx context.Context) identity {
+	execID := orZero(func() string {
+		id, _ := agent.ExecutionIDFromContext(ctx)
+		return id
+	})
 	switch c := ctx.(type) {
 	case agent.ReadonlyContext:
 		return identity{
 			agentName:    orZero(c.AgentName),
 			sessionID:    orZero(c.SessionID),
 			invocationID: orZero(c.InvocationID),
+			executionID:  execID,
 			userID:       orZero(c.UserID),
 			appName:      orZero(c.AppName),
 			branch:       orZero(c.Branch),
@@ -1768,6 +1785,7 @@ func identityOf(ctx context.Context) identity {
 	case agent.InvocationContext:
 		id := identity{
 			invocationID: orZero(c.InvocationID),
+			executionID:  execID,
 			branch:       orZero(c.Branch),
 			path:         orZero(func() string { return contextPath(ctx) }),
 		}
@@ -1782,7 +1800,7 @@ func identityOf(ctx context.Context) identity {
 		}
 		return id
 	default:
-		return identity{}
+		return identity{executionID: execID}
 	}
 }
 

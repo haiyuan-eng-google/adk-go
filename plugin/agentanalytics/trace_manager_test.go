@@ -20418,7 +20418,7 @@ func TestRepro_FailedModelCallsPinCompletedCache(t *testing.T) {
 		}
 	}
 	tm.mu.Lock()
-	kept := tm.completed[invID] != nil
+	kept := completedEntryLocked(tm, invID) != nil
 	tm.mu.Unlock()
 	if pinned > 0 || !kept {
 		t.Errorf("runs pinned by a call with no callback = %d, want 0; ordinary run's identity kept = %v, want true", pinned, kept)
@@ -20528,6 +20528,27 @@ func runOrdinaryBot(t *testing.T, p *baseplugin.Plugin) string {
 	return invID
 }
 
+func completedEntryLocked(tm *traceManager, keyOrID string) *completedTrace {
+	if c := tm.completed[keyOrID]; c != nil {
+		return c
+	}
+	key := tm.resolveTraceKeyLocked(identity{invocationID: traceKeyInvocationID(keyOrID)}, false)
+	return tm.completed[key]
+}
+
+func hasActiveInvocationLocked(tm *traceManager, keyOrID string) bool {
+	if _, ok := tm.invocations[keyOrID]; ok {
+		return true
+	}
+	prefix := traceKeyInvocationID(keyOrID) + "\x00"
+	for k := range tm.invocations {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkLateLookupFindsCompletedRun checks that the run of invID kept its
 // identity at its completion, and that a callback after its AfterRun, such as
 // OnEventCallback for the compaction summary event of the run, gets the run's
@@ -20535,7 +20556,7 @@ func runOrdinaryBot(t *testing.T, p *baseplugin.Plugin) string {
 func checkLateLookupFindsCompletedRun(t *testing.T, tm *traceManager, invID, author string) {
 	t.Helper()
 	tm.mu.Lock()
-	completed := tm.completed[invID]
+	completed := completedEntryLocked(tm, invID)
 	var want evictedTrace
 	if completed != nil {
 		want = completed.identity
@@ -20546,7 +20567,7 @@ func checkLateLookupFindsCompletedRun(t *testing.T, tm *traceManager, invID, aut
 	}
 	span := tm.eventSpan(context.Background(), identity{invocationID: invID, agentName: author}, author, "")
 	tm.mu.Lock()
-	_, active := tm.invocations[invID]
+	active := hasActiveInvocationLocked(tm, invID)
 	tm.mu.Unlock()
 	if active || span.traceID != want.traceID || span.spanID != want.spanID {
 		t.Errorf("late event place = (trace %q, span %q), active invocation started = %v; want the completed run's (trace %q, span %q) and none started",
@@ -20856,7 +20877,7 @@ func TestRunner_UnjoinedSubAgentCallOutlivesAfterRun(t *testing.T) {
 			if invID == "" && tm.completionOrder.Back() != nil {
 				invID, _ = tm.completionOrder.Back().Value.(string)
 			}
-			completed := tm.completed[invID]
+			completed := completedEntryLocked(tm, invID)
 			tm.mu.Unlock()
 			if completed == nil || completed.late == nil || !completed.late.hasOpenCalls() {
 				t.Fatalf("completed run %q handed no open model call to the late state", invID)
@@ -20869,7 +20890,7 @@ func TestRunner_UnjoinedSubAgentCallOutlivesAfterRun(t *testing.T) {
 				t.Fatal("the unjoined sub-agent never finished")
 			}
 			tm.mu.Lock()
-			_, active := tm.invocations[invID]
+			active := hasActiveInvocationLocked(tm, invID)
 			tm.mu.Unlock()
 			if completed.late.hasOpenCalls() || active {
 				t.Errorf("after the unjoined model call ended: call still open in the late state = %v, active invocation started = %v; want false, false",
@@ -20948,7 +20969,7 @@ func TestRepro_ParallelWorkerGuardrailPinsNothing(t *testing.T) {
 		}
 	}
 	tm.mu.Lock()
-	kept := tm.completed[invID] != nil
+	kept := completedEntryLocked(tm, invID) != nil
 	tm.mu.Unlock()
 	t.Logf("ordinary run identity kept = %v", kept)
 	if pinned > 0 || !kept {
@@ -21054,7 +21075,7 @@ func TestRepro_UnjoinedCallStartedAfterLauncherReturnedMovesToLate(t *testing.T)
 		}
 	}
 	tm.mu.Lock()
-	cmp := tm.completed[invID]
+	cmp := completedEntryLocked(tm, invID)
 	moved := 0
 	if cmp != nil && cmp.late != nil {
 		cmp.late.mu.Lock()
@@ -21162,14 +21183,14 @@ func TestRunner_JoinedChildStoppedAtErrorKeepsCompletedIdentities(t *testing.T) 
 			}
 		}
 		tm.mu.Lock()
-		completed := tm.completed[invID]
+		completed := completedEntryLocked(tm, invID)
 		tm.mu.Unlock()
 		if completed == nil {
 			t.Fatalf("ordinary run %d lost its completed identity at its own completion", i)
 		}
 		late := tm.invocation(t.Context(), identity{invocationID: invID, agentName: "bot"})
 		tm.mu.Lock()
-		_, active := tm.invocations[invID]
+		active := hasActiveInvocationLocked(tm, invID)
 		tm.mu.Unlock()
 		if active || late.rootSpanID != completed.identity.spanID {
 			t.Fatalf("event of ordinary run %d after AfterRun: new active invocation = %v, root span = %q, want false and the run's %q",
@@ -21190,7 +21211,7 @@ func TestRunner_JoinedChildStoppedAtErrorKeepsCompletedIdentities(t *testing.T) 
 		t.Errorf("completed runs that wait for late calls = %d, want at most %d", waiting, limit/2)
 	}
 	for i, invID := range ordinary {
-		if tm.completed[invID] == nil {
+		if completedEntryLocked(tm, invID) == nil {
 			t.Errorf("ordinary run %d lost its completed identity to runs that wait for late calls", i)
 		}
 	}
@@ -21698,7 +21719,7 @@ func TestRunner_UnjoinedStoppedStreamLeavesNoLateState(t *testing.T) {
 	}
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	c := tm.completed[invID]
+	c := completedEntryLocked(tm, invID)
 	if c == nil {
 		t.Fatalf("run %q is not completed", invID)
 	}
@@ -23594,6 +23615,640 @@ func TestLateCauseKeepsLineageWhileReaderOpen(t *testing.T) {
 		}
 		if _, purged, _ := tm.popToolSpan(ctx, live, toolKey(live, "call-2", "t"), false); len(purged) != 0 {
 			t.Errorf("%d AGENT_ERROR rows after call-2 returned, want none", len(purged))
+		}
+	})
+}
+
+type funcLLM struct {
+	name string
+	gen  func(context.Context, *model.LLMRequest, bool) iter.Seq2[*model.LLMResponse, error]
+}
+
+func (m *funcLLM) Name() string {
+	if m.name != "" {
+		return m.name
+	}
+	return "func-model"
+}
+
+func (m *funcLLM) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
+	return m.gen(ctx, req, stream)
+}
+
+func TestRunner_OverlappingRunsSharingInvocationID_IsolatedTracesAndWritesInvocationID(t *testing.T) {
+	t.Run("overlapping HITL run and failing resume sharing invocation_id stay isolated", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		ask, err := functiontool.New(functiontool.Config{
+			Name:          "ask_human",
+			Description:   "asks for approval",
+			IsLongRunning: true,
+		}, func(_ agent.Context, _ struct{}) (map[string]string, error) {
+			return map[string]string{"status": "pending"}, nil
+		})
+		if err != nil {
+			t.Fatalf("functiontool.New: %v", err)
+		}
+
+		var calls atomic.Int32
+		m := &funcLLM{
+			name: "hitl-model",
+			gen: func(context.Context, *model.LLMRequest, bool) iter.Seq2[*model.LLMResponse, error] {
+				return func(yield func(*model.LLMResponse, error) bool) {
+					switch calls.Add(1) {
+					case 1:
+						yield(&model.LLMResponse{
+							Content: &genai.Content{
+								Role:  genai.RoleModel,
+								Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{ID: "call-hitl-1", Name: "ask_human", Args: map[string]any{}}}},
+							},
+							TurnComplete: true,
+						}, nil)
+					case 2:
+						// Run 2 (answering ask_human while Run 1 is still open) fails.
+						yield(nil, errors.New("resume execution failed"))
+					default:
+						// Run 1 finishes cleanly after yielding the pending prompt.
+						yield(&model.LLMResponse{
+							Content:      textContent("model", "waiting for approval"),
+							TurnComplete: true,
+						}, nil)
+					}
+				}
+			},
+		}
+		approver, err := llmagent.New(llmagent.Config{
+			Name:  "approver",
+			Model: m,
+			Tools: []tool.Tool{ask},
+		})
+		if err != nil {
+			t.Fatalf("llmagent.New: %v", err)
+		}
+		r := newTestRunner(t, approver, p)
+		ctx := t.Context()
+
+		var pausedCallID string
+		var resumeDone atomic.Bool
+		for ev, runErr := range r.Run(ctx, "u1", "sess-overlap", textContent("user", "please approve"), agent.RunConfig{}) {
+			if runErr != nil {
+				t.Fatalf("Run 1 error = %v", runErr)
+			}
+			if ev != nil && len(ev.LongRunningToolIDs) > 0 && !resumeDone.Swap(true) {
+				pausedCallID = ev.LongRunningToolIDs[0]
+				// Start Run 2 BEFORE Run 1 finishes: Run 2 inherits the exact same
+				// invocation_id from the persisted HITL event while Run 1 is still live.
+				reply := &genai.Content{
+					Role: genai.RoleUser,
+					Parts: []*genai.Part{{
+						FunctionResponse: &genai.FunctionResponse{
+							ID:       pausedCallID,
+							Name:     "ask_human",
+							Response: map[string]any{"output": "approved"},
+						},
+					}},
+				}
+				var gotResumeErr bool
+				for _, r2Err := range r.Run(ctx, "u1", "sess-overlap", reply, agent.RunConfig{}) {
+					if r2Err != nil {
+						gotResumeErr = true
+					}
+				}
+				if !gotResumeErr {
+					t.Fatal("Run 2 succeeded, want resume error")
+				}
+			}
+		}
+		if pausedCallID == "" {
+			t.Fatal("Run 1 did not yield a LongRunningToolIDs event")
+		}
+
+		rows := collectRows(t, requests, func(rows []map[string]any) bool {
+			return len(rowsOfType(rows, EventInvocationCompleted))+len(rowsOfType(rows, EventInvocationError)) == 2
+		})
+
+		completed := onlyRowOfType(t, rows, EventInvocationCompleted)
+		errored := onlyRowOfType(t, rows, EventInvocationError)
+		if completed["status"] != "OK" {
+			t.Errorf("completed status = %v, want OK", completed["status"])
+		}
+		if errored["status"] != "ERROR" {
+			t.Errorf("errored status = %v, want ERROR", errored["status"])
+		}
+
+		sharedInvID, _ := completed["invocation_id"].(string)
+		if sharedInvID == "" {
+			t.Fatal("completed row invocation_id is empty")
+		}
+		if got := errored["invocation_id"]; got != sharedInvID {
+			t.Errorf("errored invocation_id = %v, want shared %q", got, sharedInvID)
+		}
+		for _, row := range rows {
+			if got := row["invocation_id"]; got != sharedInvID {
+				t.Errorf("%v row invocation_id = %v, want shared %q", row["event_type"], got, sharedInvID)
+			}
+		}
+
+		starts := rowsOfType(rows, EventInvocationStarting)
+		if len(starts) != 2 {
+			t.Fatalf("got %d INVOCATION_STARTING rows, want 2; events: %v", len(starts), eventTypes(rows))
+		}
+		cPlace, ePlace := placeOf(completed), placeOf(errored)
+		if cPlace.span == ePlace.span {
+			t.Errorf("overlapping runs shared invocation span_id %q, want distinct spans", cPlace.span)
+		}
+		if cPlace.trace == "" || cPlace.trace != ePlace.trace {
+			t.Errorf("overlapping runs outside ambient span trace_ids = (%q, %q), want identical non-empty invocation-derived trace_id", cPlace.trace, ePlace.trace)
+		}
+		startSpans := map[string]bool{placeOf(starts[0]).span: true, placeOf(starts[1]).span: true}
+		if !startSpans[cPlace.span] || !startSpans[ePlace.span] {
+			t.Errorf("terminal invocation spans (%q, %q) do not match starting spans %v", cPlace.span, ePlace.span, startSpans)
+		}
+		if got, _ := errored["error_message"].(string); !strings.Contains(got, "resume execution failed") {
+			t.Errorf("INVOCATION_ERROR error_message = %q, want substring %q", got, "resume execution failed")
+		}
+	})
+
+	t.Run("sequential HITL resume within late retention starts a new invocation span", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		ask, err := functiontool.New(functiontool.Config{
+			Name:          "ask_human",
+			Description:   "asks for approval",
+			IsLongRunning: true,
+		}, func(_ agent.Context, _ struct{}) (map[string]string, error) {
+			return map[string]string{"status": "pending"}, nil
+		})
+		if err != nil {
+			t.Fatalf("functiontool.New: %v", err)
+		}
+		var calls atomic.Int32
+		m := &funcLLM{
+			name: "seq-hitl-model",
+			gen: func(context.Context, *model.LLMRequest, bool) iter.Seq2[*model.LLMResponse, error] {
+				return func(yield func(*model.LLMResponse, error) bool) {
+					switch calls.Add(1) {
+					case 1:
+						yield(&model.LLMResponse{
+							Content: &genai.Content{
+								Role:  genai.RoleModel,
+								Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{ID: "call-hitl-seq", Name: "ask_human", Args: map[string]any{}}}},
+							},
+							TurnComplete: true,
+						}, nil)
+					case 2:
+						yield(&model.LLMResponse{Content: textContent("model", "waiting for approval"), TurnComplete: true}, nil)
+					default:
+						yield(&model.LLMResponse{Content: textContent("model", "all done"), TurnComplete: true}, nil)
+					}
+				}
+			},
+		}
+		approver, err := llmagent.New(llmagent.Config{Name: "approver", Model: m, Tools: []tool.Tool{ask}})
+		if err != nil {
+			t.Fatalf("llmagent.New: %v", err)
+		}
+		r := newTestRunner(t, approver, p)
+		ctx := t.Context()
+
+		var pausedCallID string
+		for ev, runErr := range r.Run(ctx, "u1", "sess-seq", textContent("user", "please approve"), agent.RunConfig{}) {
+			if runErr != nil {
+				t.Fatalf("Run 1 error = %v", runErr)
+			}
+			if ev != nil && len(ev.LongRunningToolIDs) > 0 {
+				pausedCallID = ev.LongRunningToolIDs[0]
+			}
+		}
+		if pausedCallID == "" {
+			t.Fatal("Run 1 did not yield LongRunningToolIDs")
+		}
+		reply := &genai.Content{
+			Role: genai.RoleUser,
+			Parts: []*genai.Part{{
+				FunctionResponse: &genai.FunctionResponse{
+					ID:       pausedCallID,
+					Name:     "ask_human",
+					Response: map[string]any{"output": "approved"},
+				},
+			}},
+		}
+		for _, runErr := range r.Run(ctx, "u1", "sess-seq", reply, agent.RunConfig{}) {
+			if runErr != nil {
+				t.Fatalf("Run 2 error = %v", runErr)
+			}
+		}
+
+		rows := collectRows(t, requests, func(rows []map[string]any) bool {
+			return len(rowsOfType(rows, EventInvocationCompleted)) == 2
+		})
+		if n := len(rowsOfType(rows, EventInvocationError)); n != 0 {
+			t.Fatalf("got %d INVOCATION_ERROR rows, want 0", n)
+		}
+		completes := rowsOfType(rows, EventInvocationCompleted)
+		starts := rowsOfType(rows, EventInvocationStarting)
+		if len(starts) != 2 {
+			t.Fatalf("got %d INVOCATION_STARTING rows, want 2; events: %v", len(starts), eventTypes(rows))
+		}
+		if completes[0]["invocation_id"] == "" || completes[0]["invocation_id"] != completes[1]["invocation_id"] {
+			t.Errorf("invocation_ids = (%v, %v), want identical non-empty invocation_id", completes[0]["invocation_id"], completes[1]["invocation_id"])
+		}
+		if placeOf(completes[0]).span == placeOf(completes[1]).span {
+			t.Errorf("resumed invocation reused paused span_id %q", placeOf(completes[0]).span)
+		}
+		mustLatency(t, completes[1])
+	})
+
+	t.Run("ambient OTel span propagates into UserMessage and Invocation rows", func(t *testing.T) {
+		const (
+			traceHex = "4bf92f3577b34da6a3ce929d0e0e4736"
+			spanHex  = "00f067aa0ba902b7"
+		)
+		traceID, _ := trace.TraceIDFromHex(traceHex)
+		spanID, _ := trace.SpanIDFromHex(spanHex)
+		p, requests, _ := setupTestPlugin(t)
+		root, err := agent.New(agent.Config{
+			Name: "echo",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					ev := session.NewEvent(ictx, ictx.InvocationID())
+					ev.Author = "echo"
+					ev.LLMResponse = model.LLMResponse{Content: textContent("model", "ok"), TurnComplete: true}
+					yield(ev, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New: %v", err)
+		}
+		runCtx := trace.ContextWithSpanContext(t.Context(), trace.NewSpanContext(trace.SpanContextConfig{
+			TraceID:    traceID,
+			SpanID:     spanID,
+			TraceFlags: trace.FlagsSampled,
+		}))
+		for _, runErr := range newTestRunner(t, root, p).Run(runCtx, "u1", "sess-otel", textContent("user", "hi"), agent.RunConfig{}) {
+			if runErr != nil {
+				t.Fatalf("runner.Run error = %v", runErr)
+			}
+		}
+		rows := collectRows(t, requests, untilInvocationEnd)
+		requireInvocationCompletedOK(t, rows)
+		userMsg := onlyRowOfType(t, rows, EventUserMessageReceived)
+		invStart := onlyRowOfType(t, rows, EventInvocationStarting)
+		invEnd := onlyRowOfType(t, rows, EventInvocationCompleted)
+		for _, row := range rows {
+			if got := placeOf(row).trace; got != traceHex {
+				t.Errorf("%v row trace_id = %q, want %q", row["event_type"], got, traceHex)
+			}
+		}
+		if placeOf(userMsg) != placeOf(invStart) {
+			t.Errorf("USER_MESSAGE_RECEIVED place %+v != INVOCATION_STARTING place %+v", placeOf(userMsg), placeOf(invStart))
+		}
+		if placeOf(invStart) != placeOf(invEnd) {
+			t.Errorf("INVOCATION_STARTING place %+v != INVOCATION_COMPLETED place %+v", placeOf(invStart), placeOf(invEnd))
+		}
+		if placeOf(invStart).parent != spanHex {
+			t.Errorf("INVOCATION_STARTING parent_span_id = %q, want ambient %q", placeOf(invStart).parent, spanHex)
+		}
+	})
+}
+
+func TestCustomFanOutWithCancelCauseAndOnRunError(t *testing.T) {
+	t.Run("first answer wins custom parent emits INVOCATION_COMPLETED and 0 INVOCATION_ERROR with custom branches", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		winner, err := agent.New(agent.Config{
+			Name: "winner",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					ev := session.NewEvent(ictx, ictx.InvocationID())
+					ev.Author = "winner"
+					ev.LLMResponse = model.LLMResponse{Content: textContent("model", "fast win"), TurnComplete: true}
+					yield(ev, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(winner): %v", err)
+		}
+		loser, err := agent.New(agent.Config{
+			Name: "loser",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					<-ictx.Done()
+					yield(nil, ictx.Err())
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(loser): %v", err)
+		}
+		fan, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "fan", SubAgents: []agent.Agent{winner, loser}},
+		})
+		if err != nil {
+			t.Fatalf("parallelagent.New: %v", err)
+		}
+		root, err := agent.New(agent.Config{
+			Name:      "race_root",
+			SubAgents: []agent.Agent{fan},
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					pctx, cancel := context.WithCancelCause(ictx)
+					defer cancel(nil)
+					pic := ictx.WithContext(pctx)
+					var wonContent *genai.Content
+					for ev, fanErr := range fan.Run(pic) {
+						if fanErr != nil {
+							if errors.Is(fanErr, context.Canceled) && wonContent != nil {
+								continue
+							}
+							yield(nil, fanErr)
+							return
+						}
+						if ev != nil && ev.Author == "winner" && wonContent == nil {
+							wonContent = ev.Content
+							cancel(errors.New("winner settled"))
+						}
+					}
+					final := session.NewEvent(ictx, ictx.InvocationID())
+					final.Author = "race_root"
+					final.LLMResponse = model.LLMResponse{Content: wonContent, TurnComplete: true}
+					yield(final, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(race_root): %v", err)
+		}
+
+		for _, runErr := range newTestRunner(t, root, p).Run(t.Context(), "u1", "s-win-custom", textContent("user", "race"), agent.RunConfig{}) {
+			if runErr != nil {
+				t.Fatalf("runner.Run error = %v", runErr)
+			}
+		}
+		rows := collectRows(t, requests, untilInvocationEnd)
+		requireInvocationCompletedOK(t, rows)
+	})
+
+	t.Run("first answer wins custom parent emits INVOCATION_COMPLETED when losing branch is llmagent", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		winner, err := agent.New(agent.Config{
+			Name: "winner_fast",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					ev := session.NewEvent(ictx, ictx.InvocationID())
+					ev.Author = "winner_fast"
+					ev.LLMResponse = model.LLMResponse{Content: textContent("model", "fast answer"), TurnComplete: true}
+					yield(ev, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(winner_fast): %v", err)
+		}
+		loserLLM, err := llmagent.New(llmagent.Config{
+			Name: "loser_llm",
+			Model: &funcLLM{
+				name: "slow-cancelable-model",
+				gen: func(ctx context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+					return func(yield func(*model.LLMResponse, error) bool) {
+						<-ctx.Done()
+						yield(nil, ctx.Err())
+					}
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("llmagent.New(loser_llm): %v", err)
+		}
+		fan, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "fan", SubAgents: []agent.Agent{winner, loserLLM}},
+		})
+		if err != nil {
+			t.Fatalf("parallelagent.New: %v", err)
+		}
+		root, err := agent.New(agent.Config{
+			Name:      "race_root",
+			SubAgents: []agent.Agent{fan},
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					pctx, cancel := context.WithCancelCause(ictx)
+					defer cancel(nil)
+					pic := ictx.WithContext(pctx)
+					var wonContent *genai.Content
+					for ev, fanErr := range fan.Run(pic) {
+						if fanErr != nil {
+							if errors.Is(fanErr, context.Canceled) && wonContent != nil {
+								continue
+							}
+							yield(nil, fanErr)
+							return
+						}
+						if ev != nil && ev.Author == "winner_fast" && wonContent == nil {
+							wonContent = ev.Content
+							cancel(errors.New("first answer won"))
+						}
+					}
+					final := session.NewEvent(ictx, ictx.InvocationID())
+					final.Author = "race_root"
+					final.LLMResponse = model.LLMResponse{Content: wonContent, TurnComplete: true}
+					yield(final, nil)
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(race_root): %v", err)
+		}
+
+		for _, runErr := range newTestRunner(t, root, p).Run(t.Context(), "u1", "s-win-llm", textContent("user", "race"), agent.RunConfig{}) {
+			if runErr != nil {
+				t.Fatalf("runner.Run error = %v", runErr)
+			}
+		}
+		rows := collectRows(t, requests, untilInvocationEnd)
+		requireInvocationCompletedOK(t, rows)
+	})
+
+	t.Run("failing custom parent canceling parallel branches emits branch AGENT_ERROR and INVOCATION_ERROR", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		slowStarted := make(chan struct{})
+		slowBranch, err := agent.New(agent.Config{
+			Name: "slow_branch",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					close(slowStarted)
+					<-ictx.Done()
+					yield(nil, ictx.Err())
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(slow_branch): %v", err)
+		}
+		fan, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "fan", SubAgents: []agent.Agent{slowBranch}},
+		})
+		if err != nil {
+			t.Fatalf("parallelagent.New: %v", err)
+		}
+		root, err := agent.New(agent.Config{
+			Name:      "failing_parent",
+			SubAgents: []agent.Agent{fan},
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					pctx, cancel := context.WithCancelCause(ictx)
+					defer cancel(nil)
+					pic := ictx.WithContext(pctx)
+					go func() {
+						<-slowStarted
+						cancel(errors.New("parent aborted fanout"))
+					}()
+					for _, fanErr := range fan.Run(pic) {
+						if fanErr != nil {
+							yield(nil, errors.New("parent failed after fanout cancellation"))
+							return
+						}
+					}
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(failing_parent): %v", err)
+		}
+
+		var gotRunErr error
+		for _, runErr := range newTestRunner(t, root, p).Run(t.Context(), "u1", "s-fail-parent", textContent("user", "go"), agent.RunConfig{}) {
+			if runErr != nil && gotRunErr == nil {
+				gotRunErr = runErr
+			}
+		}
+		if gotRunErr == nil {
+			t.Fatal("runner.Run error = nil, want non-nil")
+		}
+
+		rows := collectRows(t, requests, untilInvocationEnd)
+		if n := len(rowsOfType(rows, EventInvocationCompleted)); n != 0 {
+			t.Fatalf("got %d INVOCATION_COMPLETED rows, want 0; events: %v", n, eventTypes(rows))
+		}
+		invErr := onlyRowOfType(t, rows, EventInvocationError)
+		if invErr["status"] != "ERROR" {
+			t.Errorf("INVOCATION_ERROR status = %v, want ERROR", invErr["status"])
+		}
+		if msg, _ := invErr["error_message"].(string); !strings.Contains(msg, "parent aborted fanout") {
+			t.Errorf("INVOCATION_ERROR error_message = %q, want substring %q", msg, "parent aborted fanout")
+		}
+		if counts := agentErrorCounts(rows); counts["slow_branch"] != 1 {
+			t.Errorf("AGENT_ERROR counts = %v, want slow_branch == 1; events: %v", counts, eventTypes(rows))
+		}
+	})
+
+	t.Run("responded custom parent canceling parallel branches and failing emits INVOCATION_ERROR via OnRunError", func(t *testing.T) {
+		p, requests, _ := setupTestPlugin(t)
+		winnerDone := make(chan struct{})
+		var winnerDoneOnce sync.Once
+		winner, err := agent.New(agent.Config{
+			Name: "winner",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					ev := session.NewEvent(ictx, ictx.InvocationID())
+					ev.Author = "winner"
+					ev.LLMResponse = model.LLMResponse{Content: textContent("model", "fast answer"), TurnComplete: true}
+					yield(ev, nil)
+				}
+			},
+			AfterAgentCallbacks: []agent.AfterAgentCallback{
+				func(agent.Context) (*genai.Content, error) {
+					winnerDoneOnce.Do(func() { close(winnerDone) })
+					return nil, nil
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(winner): %v", err)
+		}
+		slowStarted := make(chan struct{})
+		slowBranch, err := agent.New(agent.Config{
+			Name: "slow_branch",
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					close(slowStarted)
+					<-ictx.Done()
+					yield(nil, ictx.Err())
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(slow_branch): %v", err)
+		}
+		fan, err := parallelagent.New(parallelagent.Config{
+			AgentConfig: agent.Config{Name: "fan", SubAgents: []agent.Agent{winner, slowBranch}},
+		})
+		if err != nil {
+			t.Fatalf("parallelagent.New: %v", err)
+		}
+		root, err := agent.New(agent.Config{
+			Name:      "responded_failing_parent",
+			SubAgents: []agent.Agent{fan},
+			Run: func(ictx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+				return func(yield func(*session.Event, error) bool) {
+					pctx, cancel := context.WithCancelCause(ictx)
+					defer cancel(nil)
+					pic := ictx.WithContext(pctx)
+					var wonContent *genai.Content
+					var cancelOnce sync.Once
+					for ev, fanErr := range fan.Run(pic) {
+						if fanErr != nil {
+							if errors.Is(fanErr, context.Canceled) && wonContent != nil {
+								continue
+							}
+							break
+						}
+						if ev != nil && ev.Author == "winner" && wonContent == nil {
+							wonContent = ev.Content
+							cancelOnce.Do(func() {
+								go func() {
+									<-winnerDone
+									<-slowStarted
+									cancel(errors.New("aborted losing branch after winner"))
+								}()
+							})
+						}
+					}
+					final := session.NewEvent(ictx, ictx.InvocationID())
+					final.Author = "responded_failing_parent"
+					final.LLMResponse = model.LLMResponse{Content: wonContent, TurnComplete: true}
+					if !yield(final, nil) {
+						return
+					}
+					yield(nil, errors.New("parent failed after response"))
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("agent.New(responded_failing_parent): %v", err)
+		}
+
+		var gotRunErr error
+		for _, runErr := range newTestRunner(t, root, p).Run(t.Context(), "u1", "s-responded-fail", textContent("user", "race"), agent.RunConfig{}) {
+			if runErr != nil && gotRunErr == nil {
+				gotRunErr = runErr
+			}
+		}
+		if gotRunErr == nil {
+			t.Fatal("runner.Run error = nil, want non-nil")
+		}
+
+		rows := collectRows(t, requests, untilInvocationEnd)
+		if n := len(rowsOfType(rows, EventInvocationCompleted)); n != 0 {
+			t.Fatalf("got %d INVOCATION_COMPLETED rows, want 0; events: %v", n, eventTypes(rows))
+		}
+		invErr := onlyRowOfType(t, rows, EventInvocationError)
+		if invErr["status"] != "ERROR" {
+			t.Errorf("INVOCATION_ERROR status = %v, want ERROR", invErr["status"])
+		}
+		if msg, _ := invErr["error_message"].(string); !strings.Contains(msg, "aborted losing branch after winner") {
+			t.Errorf("INVOCATION_ERROR error_message = %q, want substring %q", msg, "aborted losing branch after winner")
+		}
+		if counts := agentErrorCounts(rows); counts["slow_branch"] != 1 {
+			t.Errorf("AGENT_ERROR counts = %v, want slow_branch == 1; events: %v", counts, eventTypes(rows))
 		}
 	})
 }
