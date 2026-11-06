@@ -292,7 +292,7 @@ type BigQueryAgentAnalyticsPlugin struct {
 
 // DropStats returns cumulative event-drop and formatter-failure counts.
 // TotalDrops sums locally discarded events and writes whose success could not
-// be confirmed (QueueFullDrops + AppendFailureDrops + ShutdownDrops); it can
+// be confirmed (QueueFullDrops + RowErrorDrops + AppendFailureDrops + ShutdownDrops); it can
 // include rows committed before an acknowledgment was lost, so it is an upper
 // bound. FormatterFailureDrops separately counts payload replacement or
 // omission, which does not itself discard a row.
@@ -522,7 +522,7 @@ func newBigQueryAgentAnalyticsPlugin(
 		AfterToolCallback:   p.afterTool,
 		OnToolErrorCallback: p.onToolError,
 
-		CloseFunc: func() error {
+		CloseFunc: sync.OnceValue(func() error {
 			state.stopAsyncViewCreation()
 			// The processor uploads while it flushes, so it goes first.
 			processor.Close()
@@ -546,7 +546,7 @@ func newBigQueryAgentAnalyticsPlugin(
 			// which the plugin holds, keeps the client alive for the plugin.
 			runtime.KeepAlive(bqClient)
 			return errors.Join(closeErrs...)
-		},
+		}),
 	})
 	if err != nil {
 		processor.Close()
@@ -666,9 +666,6 @@ type eventData struct {
 	sourceEvent    *session.Event
 	author         string
 	customMetadata map[string]any
-	// customMetadataScrubbed reports that customMetadata was already run
-	// through scrubA2ACustomMetadata.
-	customMetadataScrubbed bool
 	// customMetadataLost holds the keys of customMetadata whose values lost
 	// content to a safety cap or placeholder when scrubbed (see
 	// scrubA2ACustomMetadata).
@@ -849,6 +846,16 @@ func (p *analyticsPlugin) beforeRun(ctx agent.InvocationContext) (*genai.Content
 func (p *analyticsPlugin) afterRun(ctx agent.InvocationContext) {
 	defer p.recoverCallback(EventInvocationCompleted)
 	id := identityOf(ctx)
+	var terminalEnded, flushed bool
+	defer func() {
+		if !terminalEnded {
+			p.endInvocationSafe(ctx, id)
+		}
+		if p.config.flushOnRunEnd() && !flushed {
+			flushed = true
+			p.flushRunEndSafe()
+		}
+	}()
 	unclosed, unrecErr := p.traces.popUnclosedAgentSpans(ctx, id)
 	if unrecErr == nil && ctx != nil {
 		// A canceled invocation failed even when no span is left open, for
@@ -860,7 +867,9 @@ func (p *analyticsPlugin) afterRun(ctx agent.InvocationContext) {
 
 	if unrecErr != nil || len(unclosed) > 0 {
 		p.logEvent(ctx, id, EventInvocationError, func() rowSpan {
-			return p.traces.endInvocation(ctx, id)
+			span := p.traces.endInvocation(ctx, id)
+			terminalEnded = true
+			return span
 		}, func(d *eventData) {
 			d.failed = true
 			if unrecErr != nil {
@@ -870,12 +879,35 @@ func (p *analyticsPlugin) afterRun(ctx agent.InvocationContext) {
 		})
 	} else {
 		p.logEvent(ctx, id, EventInvocationCompleted, func() rowSpan {
-			return p.traces.endInvocation(ctx, id)
+			span := p.traces.endInvocation(ctx, id)
+			terminalEnded = true
+			return span
 		}, nil)
 	}
 
 	if p.config.flushOnRunEnd() {
+		flushed = true
 		p.processor.flushRunEnd() // flush queue synchronously under ShutdownTimeout
+	}
+}
+
+func (p *analyticsPlugin) endInvocationSafe(ctx context.Context, id identity) {
+	defer func() {
+		if recover() != nil && id.invocationID != "" && p.traces != nil {
+			p.traces.mu.Lock()
+			delete(p.traces.invocations, id.invocationID)
+			p.traces.mu.Unlock()
+		}
+	}()
+	if p.traces != nil {
+		p.traces.endInvocation(ctx, id)
+	}
+}
+
+func (p *analyticsPlugin) flushRunEndSafe() {
+	defer func() { _ = recover() }()
+	if p.processor != nil {
+		p.processor.flushRunEnd()
 	}
 }
 
