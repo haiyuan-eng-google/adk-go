@@ -17,6 +17,7 @@ package agentanalytics
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +49,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
 	baseplugin "google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/session"
@@ -487,6 +491,41 @@ func TestViewDefinitions_IdentifierValidation(t *testing.T) {
 			projectID: "proj",
 			datasetID: "ds",
 			tableName: "tbl;DROP",
+			wantErr:   "invalid BigQuery table name",
+		},
+		{
+			name:      "backtick in tableName",
+			projectID: "proj",
+			datasetID: "ds",
+			tableName: "table`01",
+			wantErr:   "invalid BigQuery table name",
+		},
+		{
+			name:      "backslash in tableName",
+			projectID: "proj",
+			datasetID: "ds",
+			tableName: `table\01`,
+			wantErr:   "invalid BigQuery table name",
+		},
+		{
+			name:      "newline in tableName",
+			projectID: "proj",
+			datasetID: "ds",
+			tableName: "table\n01",
+			wantErr:   "invalid BigQuery table name",
+		},
+		{
+			name:      "line separator U+2028 in tableName",
+			projectID: "proj",
+			datasetID: "ds",
+			tableName: "table\u202801",
+			wantErr:   "invalid BigQuery table name",
+		},
+		{
+			name:      "whitespace-only Unicode Zs in tableName",
+			projectID: "proj",
+			datasetID: "ds",
+			tableName: "\u00a0\u2003",
 			wantErr:   "invalid BigQuery table name",
 		},
 		{
@@ -3455,5 +3494,1098 @@ func TestNewBigQueryAgentAnalyticsPlugin_ResolvesProjectForTableAndViews(t *test
 				t.Errorf("first view DDL = %q, want it to name %s", firstQuery, want)
 			}
 		})
+	}
+}
+
+var finalSelectAliasRe = regexp.MustCompile(`(?m)\bAS\s+([a-z0-9_]+)\s*(?:,|$)`)
+
+func extractFinalSelectAliases(t *testing.T, query string) []string {
+	t.Helper()
+	const selectMarker = "\nSELECT\n  "
+	const fromMarker = "\nFROM\n"
+	start := strings.LastIndex(query, selectMarker)
+	end := strings.LastIndex(query, fromMarker)
+	if start < 0 || end < 0 || end <= start+len(selectMarker) {
+		t.Fatalf("failed to locate final SELECT ... FROM block in query:\n%s", query)
+	}
+	body := query[start+len(selectMarker) : end]
+	matches := finalSelectAliasRe.FindAllStringSubmatch(body, -1)
+	aliases := make([]string, 0, len(matches))
+	for _, m := range matches {
+		aliases = append(aliases, m[1])
+	}
+	return aliases
+}
+
+func extractRawEventsCTE(t *testing.T, query string) string {
+	t.Helper()
+	start := strings.Index(query, "raw_events AS (")
+	end := strings.Index(query, "typed_events AS (")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("failed to locate raw_events CTE in query:\n%s", query)
+	}
+	return query[start:end]
+}
+
+func TestEvalViewDefinitions_ColumnsAndSQLStructure(t *testing.T) {
+	wantSessionColumns := []string{
+		"session_id",
+		"user_id",
+		"root_agent",
+		"session_start_timestamp",
+		"session_end_timestamp",
+		"turn_count",
+		"tool_call_count",
+		"tool_error_count",
+		"llm_error_count",
+		"agent_error_count",
+		"has_error",
+		"has_truncated_content",
+		"has_tool_loop",
+		"max_consecutive_identical_tool_calls",
+		"distinct_tools_used",
+		"total_prompt_tokens",
+		"total_completion_tokens",
+		"total_tokens",
+		"total_latency_ms",
+		"eval_ready",
+		"trace",
+	}
+	wantTurnColumns := []string{
+		"session_id",
+		"invocation_id",
+		"turn_index",
+		"user_id",
+		"root_agent",
+		"turn_start_timestamp",
+		"turn_end_timestamp",
+		"tool_call_count",
+		"tool_error_count",
+		"llm_error_count",
+		"agent_error_count",
+		"has_error",
+		"has_truncated_content",
+		"has_tool_loop",
+		"max_consecutive_identical_tool_calls",
+		"distinct_tools_used",
+		"total_prompt_tokens",
+		"total_completion_tokens",
+		"total_tokens",
+		"turn_latency_ms",
+		"eval_ready",
+		"trace",
+	}
+
+	defs, err := (Config{ProjectID: "p", DatasetID: "d", TableName: "t"}).EvalViewDefinitions()
+	if err != nil {
+		t.Fatalf("EvalViewDefinitions() error = %v", err)
+	}
+	if len(defs) != 2 {
+		t.Fatalf("len(EvalViewDefinitions) = %d, want 2", len(defs))
+	}
+
+	// Verify deterministic ordering across repeated calls.
+	defs2, err := (Config{ProjectID: "p", DatasetID: "d", TableName: "t"}).EvalViewDefinitions()
+	if err != nil {
+		t.Fatalf("second EvalViewDefinitions() error = %v", err)
+	}
+	if diff := cmp.Diff(defs, defs2); diff != "" {
+		t.Fatalf("EvalViewDefinitions() is not deterministic (-first +second):\n%s", diff)
+	}
+
+	sessionDef := defs[0]
+	turnDef := defs[1]
+	if sessionDef.Name != "v_eval_session" || sessionDef.EventType != "" {
+		t.Errorf("defs[0] = {Name:%q, EventType:%q}, want {Name:\"v_eval_session\", EventType:\"\"};", sessionDef.Name, sessionDef.EventType)
+	}
+	if turnDef.Name != "v_eval_turn" || turnDef.EventType != "" {
+		t.Errorf("defs[1] = {Name:%q, EventType:%q}, want {Name:\"v_eval_turn\", EventType:\"\"};", turnDef.Name, turnDef.EventType)
+	}
+
+	if got := extractFinalSelectAliases(t, sessionDef.Query); !cmp.Equal(got, wantSessionColumns) {
+		t.Errorf("v_eval_session columns mismatch (-want +got):\n%s", cmp.Diff(wantSessionColumns, got))
+	}
+	if got := extractFinalSelectAliases(t, turnDef.Query); !cmp.Equal(got, wantTurnColumns) {
+		t.Errorf("v_eval_turn columns mismatch (-want +got):\n%s", cmp.Diff(wantTurnColumns, got))
+	}
+
+	if !strings.HasPrefix(sessionDef.Query, "CREATE OR REPLACE VIEW `p.d.v_eval_session` AS\nWITH\n") {
+		t.Errorf("v_eval_session unexpected prefix:\n%s", sessionDef.Query[:120])
+	}
+	if !strings.HasPrefix(turnDef.Query, "CREATE OR REPLACE VIEW `p.d.v_eval_turn` AS\nWITH\n") {
+		t.Errorf("v_eval_turn unexpected prefix:\n%s", turnDef.Query[:120])
+	}
+
+	for _, def := range defs {
+		if strings.Contains(def.Query, ";") {
+			t.Errorf("%s query contains a semicolon", def.Name)
+		}
+		if got := strings.Count(def.Query, "`"); got != 4 {
+			t.Errorf("%s backtick count = %d, want 4", def.Name, got)
+		}
+		if !strings.Contains(def.Query, "FROM\n      `p.d.t`") {
+			t.Errorf("%s missing table reference `p.d.t`", def.Name)
+		}
+		for _, cte := range []string{
+			"raw_events AS (",
+			"typed_events AS (",
+			"response_events AS (",
+			"annotated_events AS (",
+			"trace_events AS (",
+			"turn_rollup AS (",
+			"turns AS (",
+			"agent_rows AS (",
+			"agent_latest AS (",
+			"agent_tool_declarations AS (",
+			"agent_configs AS (",
+			"agent_maps AS (",
+		} {
+			if !strings.Contains(def.Query, cte) {
+				t.Errorf("%s missing CTE %q", def.Name, cte)
+			}
+		}
+	}
+
+	assertQuerySHA256(t, "v_eval_session", sessionDef.Query, 20303, "bc3f0c210c6a166662fcf9a6736c7fd1830825e9b892f296cce0467ce56db177")
+	assertQuerySHA256(t, "v_eval_turn", turnDef.Query, 18832, "f2c0498f83f5ecada51579294b8e55285e153325ac0f2f65da3d96c997c913e3")
+
+	if !strings.Contains(sessionDef.Query, "session_rollup AS (") {
+		t.Error("v_eval_session missing session_rollup CTE")
+	}
+	if !strings.Contains(sessionDef.Query, "ON m.session_id = s.session_id") {
+		t.Error("v_eval_session missing session-scoped agent_maps join")
+	}
+	if !strings.Contains(turnDef.Query, "ON m.session_id = t.session_id AND m.invocation_id = t.invocation_id") {
+		t.Error("v_eval_turn missing turn-scoped agent_maps join")
+	}
+	if !strings.Contains(turnDef.Query, "'turn_index', 0,\n        'turn_id', t.invocation_id") {
+		t.Error("v_eval_turn trace.turns[0] must normalize turn_index to 0 for single-turn evaluation")
+	}
+}
+
+func assertQuerySHA256(t *testing.T, viewName, query string, wantLen int, wantSHA256 string) {
+	t.Helper()
+	if len(query) != wantLen {
+		t.Errorf("len(%s.Query) = %d, want %d", viewName, len(query), wantLen)
+	}
+	sum := sha256.Sum256([]byte(query))
+	gotSHA256 := fmt.Sprintf("%x", sum)
+	if gotSHA256 != wantSHA256 {
+		t.Errorf("%s.Query sha256 = %s, want %s", viewName, gotSHA256, wantSHA256)
+	}
+}
+
+func TestEvalViewDefinitions_CustomViewPrefixAndValidation(t *testing.T) {
+	defs, err := (Config{
+		ProjectID:  "my-proj",
+		DatasetID:  "shared_ds",
+		TableName:  "events_a",
+		ViewPrefix: "v_agent_a",
+	}).EvalViewDefinitions()
+	if err != nil {
+		t.Fatalf("EvalViewDefinitions() error = %v", err)
+	}
+	if len(defs) != 2 || defs[0].Name != "v_agent_a_eval_session" || defs[1].Name != "v_agent_a_eval_turn" {
+		t.Fatalf("EvalViewDefinitions() names = [%q, %q], want [v_agent_a_eval_session, v_agent_a_eval_turn]", defs[0].Name, defs[1].Name)
+	}
+	if !strings.HasPrefix(defs[0].Query, "CREATE OR REPLACE VIEW `my-proj.shared_ds.v_agent_a_eval_session` AS\n") {
+		t.Errorf("defs[0] query header mismatch:\n%s", defs[0].Query[:120])
+	}
+	if !strings.HasPrefix(defs[1].Query, "CREATE OR REPLACE VIEW `my-proj.shared_ds.v_agent_a_eval_turn` AS\n") {
+		t.Errorf("defs[1] query header mismatch:\n%s", defs[1].Query[:120])
+	}
+
+	for _, badTable := range []string{"events", ".events", "proj.ds."} {
+		if _, err := buildEvalSessionViewSQL(badTable, "v", nil); err == nil || !strings.Contains(err.Error(), "dataset-qualified") {
+			t.Errorf("buildEvalSessionViewSQL(%q) error = %v, want dataset-qualified error", badTable, err)
+		}
+		if _, err := buildEvalTurnViewSQL(badTable, "v", nil); err == nil || !strings.Contains(err.Error(), "dataset-qualified") {
+			t.Errorf("buildEvalTurnViewSQL(%q) error = %v, want dataset-qualified error", badTable, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name    string
+		cfg     Config
+		wantErr string
+	}{
+		{
+			name:    "invalid project ID",
+			cfg:     Config{ProjectID: "proj` --", DatasetID: "ds", TableName: "tbl"},
+			wantErr: "invalid BigQuery project ID",
+		},
+		{
+			name:    "invalid dataset ID",
+			cfg:     Config{ProjectID: "proj", DatasetID: "bad-ds", TableName: "tbl"},
+			wantErr: "invalid BigQuery dataset ID",
+		},
+		{
+			name:    "invalid table name",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "tbl;DROP"},
+			wantErr: "invalid BigQuery table name",
+		},
+		{
+			name:    "backtick in table name",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "table`01"},
+			wantErr: "invalid BigQuery table name",
+		},
+		{
+			name:    "invalid view prefix",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "tbl", ViewPrefix: "bad prefix"},
+			wantErr: "invalid BigQuery view prefix",
+		},
+		{
+			name:    "overlong eval view name",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "tbl", ViewPrefix: strings.Repeat("v", maxBigQueryIdentifierLen)},
+			wantErr: "longer than 1024 bytes",
+		},
+		{
+			name:    "table name collides with v_eval_session",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "v_eval_session"},
+			wantErr: `BigQuery view name "v_eval_session" collides with the events table "v_eval_session"`,
+		},
+		{
+			name:    "table name collides case-insensitively with v_eval_turn",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "V_Eval_Turn"},
+			wantErr: `BigQuery view name "v_eval_turn" collides with the events table "V_Eval_Turn"`,
+		},
+		{
+			name:    "unknown column in PayloadColumnDenylist",
+			cfg:     Config{ProjectID: "proj", DatasetID: "ds", TableName: "tbl", PayloadColumnDenylist: []string{"session_id"}},
+			wantErr: "unsupported PayloadColumnDenylist entry",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.cfg.EvalViewDefinitions(); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("EvalViewDefinitions() error = %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestEvalViewDefinitions_PayloadColumnDenylistProjection(t *testing.T) {
+	baseCfg := Config{ProjectID: "p", DatasetID: "d", TableName: "t"}
+
+	hashCases := []struct {
+		name              string
+		viewPrefix        string
+		denylist          []string
+		wantSessionLen    int
+		wantSessionSHA256 string
+		wantTurnLen       int
+		wantTurnSHA256    string
+	}{
+		{
+			name:              "default",
+			wantSessionLen:    20303,
+			wantSessionSHA256: "bc3f0c210c6a166662fcf9a6736c7fd1830825e9b892f296cce0467ce56db177",
+			wantTurnLen:       18832,
+			wantTurnSHA256:    "f2c0498f83f5ecada51579294b8e55285e153325ac0f2f65da3d96c997c913e3",
+		},
+		{
+			name:              "deny content_parts",
+			denylist:          []string{columnContentParts},
+			wantSessionLen:    20416,
+			wantSessionSHA256: "2e65dad8fd42acf12785e6f2e76cfe4bf5ab5c8e16abbb0c90e02f7a36099718",
+			wantTurnLen:       18945,
+			wantTurnSHA256:    "df2333594eb91a79ec0c3b2275a7092d865aebba140991748eee7e48b49f106d",
+		},
+		{
+			name:              "deny attributes",
+			denylist:          []string{columnAttributes},
+			wantSessionLen:    20325,
+			wantSessionSHA256: "33a264ce9be3175b0b2e36a6ecf733e0aae8ec64807a1e47e12132033eddad99",
+			wantTurnLen:       18854,
+			wantTurnSHA256:    "1c0fff8f3818ea9177eada1b35ac2f4cdd703b19f9a9e5f8e1ff657bbde8361a",
+		},
+		{
+			name:              "deny latency_ms",
+			denylist:          []string{columnLatencyMS},
+			wantSessionLen:    20325,
+			wantSessionSHA256: "0b371d2e11b01bfef020befd69fcc99ca574d1dc50f7962881da4e8a292eb0ba",
+			wantTurnLen:       18854,
+			wantTurnSHA256:    "1ca84667a4012bf830ab50b40868169fdf2980b6788cc91daf3fe645c989acdc",
+		},
+		{
+			name:              "deny all three with custom ViewPrefix",
+			viewPrefix:        "custom_p",
+			denylist:          []string{columnContentParts, columnAttributes, columnLatencyMS},
+			wantSessionLen:    20467,
+			wantSessionSHA256: "150bd9099f160a1397618392846aa7d57b44e7a1a05d42804fa6ffdb07d800e9",
+			wantTurnLen:       18996,
+			wantTurnSHA256:    "b4c7f63a8812635867f43bc8b538d640f96a1da306fe9b3a95fc682a70ae9d16",
+		},
+	}
+
+	for _, tc := range hashCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg
+			cfg.ViewPrefix = tc.viewPrefix
+			cfg.PayloadColumnDenylist = tc.denylist
+			defs, err := cfg.EvalViewDefinitions()
+			if err != nil {
+				t.Fatalf("EvalViewDefinitions() error = %v", err)
+			}
+			if len(defs) != 2 {
+				t.Fatalf("len(EvalViewDefinitions()) = %d, want 2", len(defs))
+			}
+			assertQuerySHA256(t, defs[0].Name, defs[0].Query, tc.wantSessionLen, tc.wantSessionSHA256)
+			assertQuerySHA256(t, defs[1].Name, defs[1].Query, tc.wantTurnLen, tc.wantTurnSHA256)
+		})
+	}
+
+	t.Run("default projects all payload columns", func(t *testing.T) {
+		defs, err := baseCfg.EvalViewDefinitions()
+		if err != nil {
+			t.Fatalf("EvalViewDefinitions() error = %v", err)
+		}
+		for _, def := range defs {
+			rawCTE := extractRawEventsCTE(t, def.Query)
+			for _, col := range []string{"\n      content,\n", "\n      content_parts,\n", "\n      attributes,\n", "\n      latency_ms,\n"} {
+				if !strings.Contains(rawCTE, col) {
+					t.Errorf("%s raw_events CTE missing %q:\n%s", def.Name, strings.TrimSpace(col), rawCTE)
+				}
+			}
+			if strings.Contains(rawCTE, "CAST(NULL AS JSON)") || strings.Contains(rawCTE, "ARRAY<STRUCT<") {
+				t.Errorf("%s raw_events CTE unexpectedly contains NULL projection:\n%s", def.Name, rawCTE)
+			}
+		}
+	})
+
+	t.Run("content_parts, attributes, and latency_ms denied project typed NULLs in raw_events", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.PayloadColumnDenylist = []string{columnContentParts, columnAttributes, columnLatencyMS}
+		defs, err := cfg.EvalViewDefinitions()
+		if err != nil {
+			t.Fatalf("EvalViewDefinitions() error = %v", err)
+		}
+		for _, def := range defs {
+			rawCTE := extractRawEventsCTE(t, def.Query)
+			for _, want := range []string{
+				"ARRAY<STRUCT<part_index INT64, mime_type STRING, text STRING, part_attributes STRING, storage_mode STRING>>[] AS content_parts",
+				"CAST(NULL AS JSON) AS attributes",
+				"CAST(NULL AS JSON) AS latency_ms",
+			} {
+				if !strings.Contains(rawCTE, want) {
+					t.Errorf("%s raw_events CTE missing %q:\n%s", def.Name, want, rawCTE)
+				}
+			}
+		}
+	})
+
+	t.Run("content denied is rejected", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.PayloadColumnDenylist = []string{columnContent}
+		if _, err := cfg.EvalViewDefinitions(); err == nil || !strings.Contains(err.Error(), `cannot build eval view SQL when "content" is in PayloadColumnDenylist`) {
+			t.Errorf("EvalViewDefinitions() with denied content error = %v, want content denylist error", err)
+		}
+	})
+}
+
+func TestViewAndEvalViewDefinitions_TableNameUnicodeAndControlChars(t *testing.T) {
+	positiveCases := []struct {
+		name              string
+		tableName         string
+		wantEvalSHA       bool
+		wantSessionLen    int
+		wantSessionSHA256 string
+		wantTurnLen       int
+		wantTurnSHA256    string
+	}{
+		{
+			name:              "ASCII space",
+			tableName:         "table 01",
+			wantEvalSHA:       true,
+			wantSessionLen:    20310,
+			wantSessionSHA256: "b63bf701e72c21927351b5d97a937203c673f3b186d5db2a1ac8d3930b788a8d",
+			wantTurnLen:       18839,
+			wantTurnSHA256:    "ec10091442e3d92257f880cb619fe6495434fa6ac4b5398b4eccc31d81a869cb",
+		},
+		{
+			name:              "Unicode Zs NO-BREAK SPACE",
+			tableName:         "table\u00a001",
+			wantEvalSHA:       true,
+			wantSessionLen:    20311,
+			wantSessionSHA256: "81deb437483c6b0e0d87624e0061dbdcceacfba0970db4bacd90304d18f540c1",
+			wantTurnLen:       18840,
+			wantTurnSHA256:    "ea51d35c478ff552ee105cf567a952bb72f54d0cf80167b117d75dfb64838a70",
+		},
+		{
+			name:      "Unicode Zs EM SPACE",
+			tableName: "table\u200301",
+		},
+		{
+			name:      "Unicode Zs IDEOGRAPHIC SPACE",
+			tableName: "table\u300001",
+		},
+		{
+			name:      "Unicode combining acute mark",
+			tableName: "tablea\u0301",
+		},
+	}
+
+	for _, tc := range positiveCases {
+		t.Run("accept_"+tc.name, func(t *testing.T) {
+			cfg := Config{ProjectID: "p", DatasetID: "d", TableName: tc.tableName}
+			wantTableRef := "`p.d." + tc.tableName + "`"
+
+			baseDefs, err := cfg.ViewDefinitions()
+			if err != nil {
+				t.Fatalf("ViewDefinitions() error = %v", err)
+			}
+			if len(baseDefs) == 0 {
+				t.Fatal("ViewDefinitions() returned 0 views")
+			}
+			for _, def := range baseDefs {
+				if !strings.Contains(def.Query, wantTableRef) {
+					t.Errorf("base view %s query missing %q", def.Name, wantTableRef)
+				}
+			}
+
+			evalDefs, err := cfg.EvalViewDefinitions()
+			if err != nil {
+				t.Fatalf("EvalViewDefinitions() error = %v", err)
+			}
+			if len(evalDefs) != 2 {
+				t.Fatalf("len(EvalViewDefinitions()) = %d, want 2", len(evalDefs))
+			}
+			for _, def := range evalDefs {
+				if !strings.Contains(def.Query, wantTableRef) {
+					t.Errorf("eval view %s query missing %q", def.Name, wantTableRef)
+				}
+			}
+			if tc.wantEvalSHA {
+				assertQuerySHA256(t, evalDefs[0].Name, evalDefs[0].Query, tc.wantSessionLen, tc.wantSessionSHA256)
+				assertQuerySHA256(t, evalDefs[1].Name, evalDefs[1].Query, tc.wantTurnLen, tc.wantTurnSHA256)
+			}
+		})
+	}
+
+	negativeCases := []struct {
+		name      string
+		tableName string
+	}{
+		{name: "backtick", tableName: "table`01"},
+		{name: "backslash", tableName: `table\01`},
+		{name: "newline", tableName: "table\n01"},
+		{name: "carriage return", tableName: "table\r01"},
+		{name: "NUL byte", tableName: "table\x0001"},
+		{name: "Unicode Zl U+2028", tableName: "table\u202801"},
+		{name: "Unicode Zp U+2029", tableName: "table\u202901"},
+		{name: "whitespace-only Zs", tableName: "\u00a0\u2003"},
+		{name: "semicolon", tableName: "tbl;DROP"},
+		{name: "dot", tableName: "proj.ds.tbl"},
+		{name: "exceeds max length", tableName: strings.Repeat("a", 1025)},
+		{name: "invalid UTF-8", tableName: "\xff\xfe"},
+	}
+
+	for _, tc := range negativeCases {
+		t.Run("reject_"+tc.name, func(t *testing.T) {
+			cfg := Config{ProjectID: "p", DatasetID: "d", TableName: tc.tableName}
+			if _, err := cfg.ViewDefinitions(); err == nil || !strings.Contains(err.Error(), "invalid BigQuery table name") {
+				t.Errorf("ViewDefinitions() error = %v, want invalid BigQuery table name", err)
+			}
+			if _, err := cfg.EvalViewDefinitions(); err == nil || !strings.Contains(err.Error(), "invalid BigQuery table name") {
+				t.Errorf("EvalViewDefinitions() error = %v, want invalid BigQuery table name", err)
+			}
+		})
+	}
+}
+
+func TestCreateEvalViews_ConfigValidation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("rejects content in PayloadColumnDenylist when CreateEvalViews is true", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.ProjectID = "test-project"
+		cfg.DatasetID = "test_dataset"
+		cfg.TableName = "test-table"
+		cfg.CreateEvalViews = true
+		cfg.PayloadColumnDenylist = []string{columnContent}
+		_, err := NewBigQueryAgentAnalyticsPluginWithClients(ctx, cfg, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), `CreateEvalViews cannot be used when "content" is in PayloadColumnDenylist`) {
+			t.Errorf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v, want content denylist rejection", err)
+		}
+	})
+
+	t.Run("allows content_parts, attributes, and latency_ms in PayloadColumnDenylist when CreateEvalViews is true", func(t *testing.T) {
+		p, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+			c.PayloadColumnDenylist = []string{columnContentParts, columnAttributes, columnLatencyMS}
+		})
+		_ = p
+	})
+
+	t.Run("rejects required events in EventDenylist when CreateEvalViews is true", func(t *testing.T) {
+		for _, reqEvent := range append(append([]string(nil), evalViewRequiredEvents...), "EVENT") {
+			cfg := DefaultConfig()
+			cfg.ProjectID = "test-project"
+			cfg.DatasetID = "test_dataset"
+			cfg.TableName = "test-table"
+			cfg.CreateEvalViews = true
+			cfg.EventDenylist = []string{reqEvent}
+			_, err := NewBigQueryAgentAnalyticsPluginWithClients(ctx, cfg, nil, nil)
+			if err == nil || !strings.Contains(err.Error(), "CreateEvalViews cannot be used when required events are in EventDenylist") {
+				t.Errorf("EventDenylist=[%q] error = %v, want required trace events error", reqEvent, err)
+			}
+		}
+	})
+
+	t.Run("allows non-required events in EventDenylist when CreateEvalViews is true", func(t *testing.T) {
+		p, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+			c.EventDenylist = []string{EventStateDelta, EventNodeOutput}
+		})
+		_ = p
+	})
+
+	t.Run("rejects partial EventAllowlist and accepts full or EVENT-umbrella EventAllowlist", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.ProjectID = "test-project"
+		cfg.DatasetID = "test_dataset"
+		cfg.TableName = "test-table"
+		cfg.CreateEvalViews = true
+		cfg.EventAllowlist = []string{EventUserMessageReceived, EventAgentResponse}
+		_, err := NewBigQueryAgentAnalyticsPluginWithClients(ctx, cfg, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "CreateEvalViews cannot be used unless EventAllowlist includes all required events; missing:") || !strings.Contains(err.Error(), EventToolStarting) {
+			t.Errorf("partial EventAllowlist error = %v, want missing required events error", err)
+		}
+
+		pFull, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+			c.EventAllowlist = append([]string(nil), evalViewRequiredEvents...)
+		})
+		_ = pFull
+
+		pUmbrella, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+			c.EventAllowlist = []string{
+				"EVENT",
+				EventAgentStarting,
+				EventInvocationCompleted,
+				EventLLMRequest,
+				EventToolCompleted,
+				EventToolStarting,
+				EventUserMessageReceived,
+			}
+		})
+		_ = pUmbrella
+	})
+}
+
+func TestCreateEvalViews_StartupAndSyncLifecycle(t *testing.T) {
+	ctx := context.Background()
+
+	newWriteClient := func(t *testing.T) *bqstorage.BigQueryWriteClient {
+		t.Helper()
+		lis, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		gSrv := grpc.NewServer()
+		storagepb.RegisterBigQueryWriteServer(gSrv, &fakeBigQueryWriteServer{})
+		go func() { _ = gSrv.Serve(lis) }()
+		t.Cleanup(gSrv.Stop)
+
+		conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+
+		wc, err := bqstorage.NewBigQueryWriteClient(ctx, option.WithGRPCConn(conn))
+		if err != nil {
+			t.Fatalf("NewBigQueryWriteClient: %v", err)
+		}
+		return wc
+	}
+
+	t.Run("CreateEvalViews with DisableCreateViews false creates 27 views on startup and in SyncViews", func(t *testing.T) {
+		const wantTotalViews = 27
+		allDone := make(chan struct{})
+		var jobCount atomic.Int32
+		var mu sync.Mutex
+		var jobQueries []string
+
+		httpClient := &http.Client{
+			Transport: &mockTransport{
+				roundTrip: func(r *http.Request) (*http.Response, error) {
+					if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/jobs") {
+						b, _ := io.ReadAll(r.Body)
+						var payload struct {
+							Configuration struct {
+								Query struct {
+									Query string `json:"query"`
+								} `json:"query"`
+							} `json:"configuration"`
+						}
+						_ = json.Unmarshal(b, &payload)
+						mu.Lock()
+						jobQueries = append(jobQueries, payload.Configuration.Query.Query)
+						mu.Unlock()
+						if int(jobCount.Add(1)) == wantTotalViews {
+							close(allDone)
+						}
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Body:       io.NopCloser(strings.NewReader(`{"jobReference":{"projectId":"test-project","jobId":"job-1"},"status":{"state":"DONE"}}`)),
+						}, nil
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader("{}")),
+					}, nil
+				},
+			},
+		}
+		bqClient, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatalf("bq.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = bqClient.Close() })
+
+		cfg := DefaultConfig()
+		cfg.ProjectID = "test-project"
+		cfg.DatasetID = "test_dataset"
+		cfg.TableName = "test-table"
+		cfg.CreateEvalViews = true
+
+		p, err := NewBigQueryAgentAnalyticsPluginWithClients(ctx, cfg, bqClient, newWriteClient(t))
+		if err != nil {
+			t.Fatalf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v", err)
+		}
+		t.Cleanup(func() { _ = p.Close() })
+
+		select {
+		case <-allDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %d startup view DDL jobs; got %d", wantTotalViews, jobCount.Load())
+		}
+
+		mu.Lock()
+		gotQueries := append([]string(nil), jobQueries...)
+		mu.Unlock()
+		if len(gotQueries) != wantTotalViews {
+			t.Fatalf("startup DDL count = %d, want %d", len(gotQueries), wantTotalViews)
+		}
+		if !strings.Contains(gotQueries[len(gotQueries)-2], "v_eval_session") {
+			t.Errorf("second-to-last startup view query missing v_eval_session:\n%s", gotQueries[len(gotQueries)-2][:120])
+		}
+		if !strings.Contains(gotQueries[len(gotQueries)-1], "v_eval_turn") {
+			t.Errorf("last startup view query missing v_eval_turn:\n%s", gotQueries[len(gotQueries)-1][:120])
+		}
+
+		bqaap, ok := AsBigQueryAgentAnalyticsPlugin(p)
+		if !ok {
+			t.Fatal("AsBigQueryAgentAnalyticsPlugin(p) = false")
+		}
+		fakeRunner := &fakeViewRunner{}
+		bqaap.runner = fakeRunner
+		if err := bqaap.SyncViews(ctx); err != nil {
+			t.Fatalf("SyncViews() error = %v", err)
+		}
+		names := fakeRunner.executedNames()
+		if len(names) != wantTotalViews {
+			t.Fatalf("SyncViews() with CreateEvalViews=true executed %d views, want %d", len(names), wantTotalViews)
+		}
+		if names[len(names)-2] != "v_eval_session" || names[len(names)-1] != "v_eval_turn" {
+			t.Errorf("SyncViews() trailing views = %v, want [v_eval_session, v_eval_turn]", names[len(names)-2:])
+		}
+	})
+
+	t.Run("standalone CreateEvalViews with DisableCreateViews true creates only the 2 eval views on startup", func(t *testing.T) {
+		allDone := make(chan struct{})
+		var jobCount atomic.Int32
+		var mu sync.Mutex
+		var jobQueries []string
+
+		httpClient := &http.Client{
+			Transport: &mockTransport{
+				roundTrip: func(r *http.Request) (*http.Response, error) {
+					if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/jobs") {
+						b, _ := io.ReadAll(r.Body)
+						var payload struct {
+							Configuration struct {
+								Query struct {
+									Query string `json:"query"`
+								} `json:"query"`
+							} `json:"configuration"`
+						}
+						_ = json.Unmarshal(b, &payload)
+						mu.Lock()
+						jobQueries = append(jobQueries, payload.Configuration.Query.Query)
+						mu.Unlock()
+						if int(jobCount.Add(1)) == 2 {
+							close(allDone)
+						}
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Body:       io.NopCloser(strings.NewReader(`{"jobReference":{"projectId":"test-project","jobId":"job-1"},"status":{"state":"DONE"}}`)),
+						}, nil
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader("{}")),
+					}, nil
+				},
+			},
+		}
+		bqClient, err := bq.NewClient(ctx, "test-project", option.WithHTTPClient(httpClient))
+		if err != nil {
+			t.Fatalf("bq.NewClient: %v", err)
+		}
+		t.Cleanup(func() { _ = bqClient.Close() })
+
+		cfg := DefaultConfig()
+		cfg.ProjectID = "test-project"
+		cfg.DatasetID = "test_dataset"
+		cfg.TableName = "test-table"
+		cfg.DisableCreateViews = true
+		cfg.CreateEvalViews = true
+		cfg.ViewPrefix = "v_only_eval"
+
+		p, err := NewBigQueryAgentAnalyticsPluginWithClients(ctx, cfg, bqClient, newWriteClient(t))
+		if err != nil {
+			t.Fatalf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v", err)
+		}
+		select {
+		case <-allDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for 2 eval view DDL jobs; got %d", jobCount.Load())
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(jobQueries) != 2 {
+			t.Fatalf("executed %d DDL jobs, want 2", len(jobQueries))
+		}
+		if !strings.Contains(jobQueries[0], "v_only_eval_eval_session") || !strings.Contains(jobQueries[1], "v_only_eval_eval_turn") {
+			t.Errorf("unexpected standalone eval view queries:\n[0]=%s\n[1]=%s", jobQueries[0][:120], jobQueries[1][:120])
+		}
+	})
+
+	t.Run("SyncEvalViews executes the 2 eval views even when CreateEvalViews is false and validates config", func(t *testing.T) {
+		var nilPlugin *BigQueryAgentAnalyticsPlugin
+		if err := nilPlugin.SyncEvalViews(ctx); err == nil {
+			t.Error("nilPlugin.SyncEvalViews() error = nil, want error")
+		}
+
+		p, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = false
+			c.ViewPrefix = "v_manual"
+		})
+		bqaap, ok := AsBigQueryAgentAnalyticsPlugin(p)
+		if !ok {
+			t.Fatal("AsBigQueryAgentAnalyticsPlugin(p) = false")
+		}
+		fakeRunner := &fakeViewRunner{
+			errFor: map[string]error{
+				"v_manual_eval_session": &googleapi.Error{Code: http.StatusConflict, Message: "conflict"},
+			},
+		}
+		bqaap.runner = fakeRunner
+		if err := bqaap.SyncEvalViews(ctx); err != nil {
+			t.Fatalf("SyncEvalViews() error = %v, want nil", err)
+		}
+		if diff := cmp.Diff([]string{"v_manual_eval_session", "v_manual_eval_turn"}, fakeRunner.executedNames()); diff != "" {
+			t.Errorf("SyncEvalViews() executed names mismatch (-want +got):\n%s", diff)
+		}
+
+		// When content is in PayloadColumnDenylist (with CreateEvalViews=false at construction),
+		// SyncEvalViews rejects the call with a clear error.
+		pDeniedContent, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.PayloadColumnDenylist = []string{columnContent}
+		})
+		bqaapDenied, _ := AsBigQueryAgentAnalyticsPlugin(pDeniedContent)
+		bqaapDenied.runner = &fakeViewRunner{}
+		if err := bqaapDenied.SyncEvalViews(ctx); err == nil || !strings.Contains(err.Error(), `cannot create eval views when "content" is in PayloadColumnDenylist`) {
+			t.Errorf("SyncEvalViews() with content denied error = %v, want content denylist error", err)
+		}
+
+		// When a required trace event is excluded by EventDenylist (with CreateEvalViews=false),
+		// SyncEvalViews rejects the call.
+		pDeniedEvent, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.EventDenylist = []string{EventToolStarting}
+		})
+		bqaapDeniedEvent, _ := AsBigQueryAgentAnalyticsPlugin(pDeniedEvent)
+		bqaapDeniedEvent.runner = &fakeViewRunner{}
+		if err := bqaapDeniedEvent.SyncEvalViews(ctx); err == nil || !strings.Contains(err.Error(), "cannot create eval views when required events are in EventDenylist") {
+			t.Errorf("SyncEvalViews() with TOOL_STARTING denied error = %v, want required trace events error", err)
+		}
+
+		// When TableName collides with v_eval_session and CreateEvalViews=true, startup skips view creation and logs why.
+		logger := &recordingLogger{}
+		pCollision, _, _ := setupTestPluginWithConfig(t, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+			c.TableName = "v_eval_session"
+			c.Logger = logger
+		})
+		if !logger.contains("agentanalytics: skipping view creation") {
+			t.Errorf("expected startup log for skipped eval view creation on table collision, got:\n%s", logger)
+		}
+		bqaapCollision, _ := AsBigQueryAgentAnalyticsPlugin(pCollision)
+		bqaapCollision.runner = &fakeViewRunner{}
+		if err := bqaapCollision.SyncEvalViews(ctx); err == nil || !strings.Contains(err.Error(), "collides with the events table") {
+			t.Errorf("SyncEvalViews() on colliding TableName error = %v, want collision error", err)
+		}
+	})
+}
+
+type evalAgentInvocationContext struct {
+	*mockInvocationContext
+	ag agent.Agent
+}
+
+func (c *evalAgentInvocationContext) Agent() agent.Agent { return c.ag }
+
+func TestEvalViews_JSONPathCompatibilityWithWrittenRows(t *testing.T) {
+	evalDefs, err := (Config{ProjectID: "test-project", DatasetID: "test_dataset", TableName: "agent_events"}).EvalViewDefinitions()
+	if err != nil {
+		t.Fatalf("EvalViewDefinitions() error = %v", err)
+	}
+	jsonPathLiteralRe := regexp.MustCompile(`'(\$\.[^']+)'`)
+	extractedSet := make(map[string]bool)
+	for _, def := range evalDefs {
+		for _, m := range jsonPathLiteralRe.FindAllStringSubmatch(def.Query, -1) {
+			extractedSet[m[1]] = true
+		}
+	}
+	gotSQLPaths := make([]string, 0, len(extractedSet))
+	for p := range extractedSet {
+		gotSQLPaths = append(gotSQLPaths, p)
+	}
+	slices.Sort(gotSQLPaths)
+	wantSQLPaths := []string{
+		"$.agent_description",
+		"$.args",
+		"$.cache_type",
+		"$.description",
+		"$.finish_reason",
+		"$.from_agent",
+		"$.function_response",
+		"$.name",
+		"$.parameters",
+		"$.response",
+		"$.result",
+		"$.root_agent_name",
+		"$.static_instruction",
+		"$.sub_agents",
+		"$.text_summary",
+		"$.to_agent",
+		"$.tool",
+		"$.tools",
+		"$.total_ms",
+		"$.usage.completion",
+		"$.usage.prompt",
+		"$.usage.total",
+	}
+	if diff := cmp.Diff(wantSQLPaths, gotSQLPaths); diff != "" {
+		t.Fatalf("extracted eval SQL JSON paths mismatch (-want +got):\n%s", diff)
+	}
+
+	p, requests, mCtx := setupTestPluginWithConfig(t, func(c *Config) {
+		c.DisableCreateViews = true
+	})
+	mCtx.functionCallID = "fc-weather-1"
+	rootName := mCtx.AgentName()
+	if rootName == "" {
+		rootName = "test-agent"
+		mCtx.agentName = rootName
+	}
+
+	subAg, err := llmagent.New(llmagent.Config{
+		Name:        "summary-agent",
+		Description: "Summarizes weather",
+	})
+	if err != nil {
+		t.Fatalf("llmagent.New(summary-agent) error = %v", err)
+	}
+	rootAg, err := llmagent.New(llmagent.Config{
+		Name:        rootName,
+		Description: "Weather coordinator",
+		Model:       &scriptedLLM{},
+		Instruction: "Check weather before answering.",
+		SubAgents:   []agent.Agent{subAg},
+	})
+	if err != nil {
+		t.Fatalf("llmagent.New(%s) error = %v", rootName, err)
+	}
+	invCtx := &evalAgentInvocationContext{
+		mockInvocationContext: mCtx,
+		ag:                    rootAg,
+	}
+
+	weatherTool := &declaredTool{
+		fakeTool: fakeTool{name: "get_weather", description: "Fetches current weather for a city"},
+		decl: &genai.FunctionDeclaration{
+			Name:                 "get_weather",
+			Description:          "Fetches current weather for a city",
+			ParametersJsonSchema: map[string]any{"type": "object"},
+		},
+	}
+
+	userMsg := &genai.Content{
+		Role:  "user",
+		Parts: []*genai.Part{{Text: "check weather in Paris"}},
+	}
+	toolRespMsg := &genai.Content{
+		Role: "user",
+		Parts: []*genai.Part{{
+			FunctionResponse: &genai.FunctionResponse{
+				ID:       "fc-weather-1",
+				Name:     "get_weather",
+				Response: map[string]any{"temp_c": 20},
+			},
+		}},
+	}
+	llmReq := &model.LLMRequest{
+		Model: "gemini-2.5-pro",
+		Config: &genai.GenerateContentConfig{
+			SystemInstruction: &genai.Content{
+				Parts: []*genai.Part{{Text: "You are a helpful weather assistant."}},
+			},
+		},
+		Tools:    map[string]any{"get_weather": weatherTool},
+		Contents: []*genai.Content{userMsg, toolRespMsg},
+	}
+	llmResp := &model.LLMResponse{
+		ModelVersion: "gemini-2.5-pro-001",
+		FinishReason: genai.FinishReasonStop,
+		Content: &genai.Content{
+			Role:  "model",
+			Parts: []*genai.Part{{Text: "It is 20C and sunny in Paris."}},
+		},
+		UsageMetadata: &genai.GenerateContentResponseUsageMetadata{
+			PromptTokenCount:        12,
+			CandidatesTokenCount:    8,
+			TotalTokenCount:         20,
+			CachedContentTokenCount: 4,
+		},
+	}
+
+	var errs callbackErrors
+	errs.add(p.OnUserMessageCallback()(invCtx, userMsg))
+	errs.add(p.BeforeRunCallback()(invCtx))
+	errs.add(p.BeforeAgentCallback()(invCtx))
+	errs.add(p.BeforeModelCallback()(invCtx, llmReq))
+	errs.add(p.AfterModelCallback()(invCtx, llmResp, nil))
+	errs.add(p.BeforeToolCallback()(invCtx, weatherTool, map[string]any{"city": "Paris"}))
+	errs.add(p.AfterToolCallback()(invCtx, weatherTool, map[string]any{"city": "Paris"}, map[string]any{"temp_c": 20}, nil))
+
+	errs.add(p.OnEventCallback()(invCtx, &session.Event{
+		ID:     "ev-transfer-1",
+		Author: rootName,
+		Actions: session.EventActions{
+			TransferToAgent: "summary-agent",
+		},
+	}))
+	errs.add(p.OnEventCallback()(invCtx, &session.Event{
+		ID:          "ev-final-1",
+		Author:      rootName,
+		LLMResponse: *llmResp,
+	}))
+	errs.add(p.AfterAgentCallback()(invCtx))
+	errs.check(t)
+	p.AfterRunCallback()(invCtx)
+
+	rows := collectRows(t, requests, untilEventType(EventInvocationCompleted))
+	byType := make(map[string]map[string]any, len(rows))
+	for _, r := range rows {
+		et, _ := r["event_type"].(string)
+		byType[et] = r
+	}
+
+	verifiedGoPaths := make(map[string]bool)
+	checkDocPath := func(label string, doc map[string]any, path string) {
+		t.Helper()
+		if _, ok := resolveJSONPath(doc, path); !ok {
+			t.Errorf("%s path %q did not resolve against emitted payload: %#v", label, path, doc)
+			return
+		}
+		verifiedGoPaths[path] = true
+	}
+	checkPath := func(eventType, col, path string) {
+		t.Helper()
+		row, ok := byType[eventType]
+		if !ok {
+			t.Fatalf("missing emitted row for event_type %s", eventType)
+		}
+		doc := jsonObjectColumn(t, row, col)
+		checkDocPath(eventType+"."+col, doc, path)
+	}
+
+	// Verify all JSON paths extracted in raw_events, parsed_events, and agent_rows match Go plugin payloads.
+	checkPath(EventUserMessageReceived, columnContent, "$.text_summary")
+	checkPath(EventAgentStarting, columnAttributes, "$.root_agent_name")
+	checkPath(EventAgentStarting, columnAttributes, "$.agent_description")
+	checkPath(EventAgentStarting, columnAttributes, "$.sub_agents")
+	checkPath(EventLLMRequest, columnAttributes, "$.tools")
+	checkPath(EventLLMResponse, columnContent, "$.usage.prompt")
+	checkPath(EventLLMResponse, columnContent, "$.usage.completion")
+	checkPath(EventLLMResponse, columnContent, "$.usage.total")
+	checkPath(EventLLMResponse, columnAttributes, "$.finish_reason")
+	checkPath(EventLLMResponse, columnAttributes, "$.cache_type")
+	checkPath(EventToolStarting, columnContent, "$.tool")
+	checkPath(EventToolStarting, columnContent, "$.args")
+	checkPath(EventToolCompleted, columnContent, "$.tool")
+	checkPath(EventToolCompleted, columnContent, "$.result")
+	checkPath(EventAgentTransfer, columnContent, "$.from_agent")
+	checkPath(EventAgentTransfer, columnContent, "$.to_agent")
+	checkPath(EventAgentResponse, columnContent, "$.response")
+	checkPath(EventInvocationCompleted, columnLatencyMS, "$.total_ms")
+
+	llmReqRow := byType[EventLLMRequest]
+	reqAttrs := jsonObjectColumn(t, llmReqRow, columnAttributes)
+	toolsSlice, ok := reqAttrs["tools"].([]any)
+	if !ok || len(toolsSlice) == 0 {
+		t.Fatalf("LLM_REQUEST.attributes.tools = %#v, want non-empty array", reqAttrs["tools"])
+	}
+	toolDecl, ok := toolsSlice[0].(map[string]any)
+	if !ok {
+		t.Fatalf("LLM_REQUEST.attributes.tools[0] = %#v, want object", toolsSlice[0])
+	}
+	checkDocPath("LLM_REQUEST.attributes.tools[0]", toolDecl, "$.name")
+	checkDocPath("LLM_REQUEST.attributes.tools[0]", toolDecl, "$.description")
+	checkDocPath("LLM_REQUEST.attributes.tools[0]", toolDecl, "$.parameters")
+
+	foundFuncResp := false
+	for _, part := range contentPartsOf(t, llmReqRow) {
+		rawPartAttrs, _ := part["part_attributes"].(string)
+		if rawPartAttrs == "" {
+			continue
+		}
+		var partAttrs map[string]any
+		if err := json.Unmarshal([]byte(rawPartAttrs), &partAttrs); err != nil {
+			t.Fatalf("LLM_REQUEST part_attributes JSON unmarshal error: %v (%q)", err, rawPartAttrs)
+		}
+		if _, ok := partAttrs["function_response"]; ok {
+			checkDocPath("LLM_REQUEST.content_parts[].part_attributes", partAttrs, "$.function_response")
+			foundFuncResp = true
+			break
+		}
+	}
+	if !foundFuncResp {
+		t.Fatalf("LLM_REQUEST content_parts missing $.function_response in part_attributes: %#v", llmReqRow[columnContentParts])
+	}
+
+	pythonOnlySQLPaths := map[string]bool{
+		// Emitted by Python plugin variants; eval views coalesce $.static_instruction with instruction fields.
+		"$.static_instruction": true,
+	}
+	for _, sqlPath := range gotSQLPaths {
+		if !verifiedGoPaths[sqlPath] && !pythonOnlySQLPaths[sqlPath] {
+			t.Errorf("eval SQL JSON path %q extracted from rendered views was not verified against Go-emitted rows", sqlPath)
+		}
 	}
 }

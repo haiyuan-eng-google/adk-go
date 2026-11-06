@@ -771,3 +771,158 @@ func TestPlugin_SchemaCallbacks_ConcurrentPlugins(t *testing.T) {
 		t.Errorf("OnSchemaReady called %d times across %d plugins, want %d", got, plugins, plugins)
 	}
 }
+
+func TestPlugin_OnSchemaReady_WithDisableCreateViewsAndCreateEvalViews(t *testing.T) {
+	t.Run("DisableCreateViews true with CreateEvalViews true fires OnSchemaReady asynchronously only after both eval views succeed", func(t *testing.T) {
+		firstStarted := make(chan struct{})
+		var firstOnce sync.Once
+		releaseJobs := make(chan struct{})
+		transport := &tableTransport{t: t}
+		transport.jobHook = func(r *http.Request) (*http.Response, error) {
+			if transport.jobs.Load() == 1 {
+				firstOnce.Do(func() { close(firstStarted) })
+			}
+			select {
+			case <-releaseJobs:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+			return nil, nil
+		}
+		rec := newSchemaCallbackRecorder()
+		p, err := newSchemaCallbackPlugin(t, transport, rec, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+		})
+		if err != nil {
+			t.Fatalf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v", err)
+		}
+		select {
+		case <-firstStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("eval view startup pass did not start within 5s")
+		}
+		if got := rec.ready.Load(); got != 0 {
+			close(releaseJobs)
+			t.Fatalf("OnSchemaReady called %d times before eval views finished, want 0", got)
+		}
+		close(releaseJobs)
+		if !rec.waitReady(1, 5*time.Second) {
+			t.Fatalf("OnSchemaReady called %d times within 5s after eval views completed, want 1", rec.ready.Load())
+		}
+		if got := transport.jobs.Load(); got != 2 {
+			t.Errorf("view DDL jobs = %d when OnSchemaReady ran, want 2 (v_eval_session, v_eval_turn)", got)
+		}
+		if errs := rec.errors(); len(errs) != 0 {
+			t.Errorf("OnSchemaError called with %v, want no calls", errs)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if got := rec.ready.Load(); got != 1 {
+			t.Errorf("OnSchemaReady called %d times after Close, want 1", got)
+		}
+	})
+
+	t.Run("DisableCreateViews true with CreateEvalViews true does not fire OnSchemaReady when v_eval_turn fails", func(t *testing.T) {
+		transport := &tableTransport{t: t}
+		transport.jobHook = func(*http.Request) (*http.Response, error) {
+			if transport.jobs.Load() == 2 {
+				return transport.apiError(http.StatusForbidden), nil
+			}
+			return nil, nil
+		}
+		rec := newSchemaCallbackRecorder()
+		logger := &recordingLogger{}
+		p, err := newSchemaCallbackPlugin(t, transport, rec, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+			c.Logger = logger
+		})
+		if err != nil {
+			t.Fatalf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v", err)
+		}
+		const wantLog = "view creation finished: 1 created, 1 failed of 2; call SyncViews to retry"
+		deadline := time.Now().Add(5 * time.Second)
+		for !logger.contains(wantLog) && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !logger.contains(wantLog) {
+			t.Fatalf("logger lacks %q; got:\n%s", wantLog, logger)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if got := rec.ready.Load(); got != 0 {
+			t.Errorf("OnSchemaReady called %d times when v_eval_turn failed, want 0", got)
+		}
+		if errs := rec.errors(); len(errs) != 0 {
+			t.Errorf("OnSchemaError called with %v on view failure, want no calls", errs)
+		}
+	})
+
+	t.Run("DisableCreateViews false with CreateEvalViews true waits for all event and eval views", func(t *testing.T) {
+		transport := &tableTransport{t: t}
+		rec := newSchemaCallbackRecorder()
+		p, err := newSchemaCallbackPlugin(t, transport, rec, func(c *Config) {
+			c.DisableCreateViews = false
+			c.CreateEvalViews = true
+		})
+		if err != nil {
+			t.Fatalf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v", err)
+		}
+		if !rec.waitReady(1, 5*time.Second) {
+			t.Fatalf("OnSchemaReady called %d times within 5s, want 1", rec.ready.Load())
+		}
+		if got, want := transport.jobs.Load(), int32(len(eventViewSpecs)+2); got != want {
+			t.Errorf("view DDL jobs = %d when OnSchemaReady ran, want %d", got, want)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if got := rec.ready.Load(); got != 1 {
+			t.Errorf("OnSchemaReady called %d times after Close, want 1", got)
+		}
+	})
+
+	t.Run("DisableCreateViews true with CreateEvalViews true does not fire when preempted by SyncEvalViews", func(t *testing.T) {
+		secondStarted := make(chan struct{})
+		var secondOnce sync.Once
+		transport := &tableTransport{t: t}
+		transport.jobHook = func(r *http.Request) (*http.Response, error) {
+			if transport.jobs.Load() == 2 {
+				secondOnce.Do(func() {
+					close(secondStarted)
+					<-r.Context().Done()
+				})
+			}
+			return nil, nil
+		}
+		rec := newSchemaCallbackRecorder()
+		p, err := newSchemaCallbackPlugin(t, transport, rec, func(c *Config) {
+			c.DisableCreateViews = true
+			c.CreateEvalViews = true
+		})
+		if err != nil {
+			t.Fatalf("NewBigQueryAgentAnalyticsPluginWithClients() error = %v", err)
+		}
+		select {
+		case <-secondStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second eval view job did not start within 5s")
+		}
+		bqaap, ok := AsBigQueryAgentAnalyticsPlugin(p)
+		if !ok {
+			t.Fatal("AsBigQueryAgentAnalyticsPlugin(p) = false")
+		}
+		if err := bqaap.SyncEvalViews(context.Background()); err != nil {
+			t.Fatalf("SyncEvalViews() error = %v", err)
+		}
+		if err := p.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		if got := rec.ready.Load(); got != 0 {
+			t.Errorf("OnSchemaReady called %d times after SyncEvalViews preempted startup pass, want 0", got)
+		}
+	})
+}
